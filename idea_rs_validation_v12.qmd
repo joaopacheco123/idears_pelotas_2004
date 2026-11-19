@@ -1,0 +1,2071 @@
+---
+title: "Predicting adolescent depression across time: a within-population, decade-apart validation of the Identifying Depression Early in Adolescence Risk Score (IDEA-RS)"
+subtitle: "Analysis code"
+author: "João Pedro Gonçalves Pacheco"
+date: today
+format:
+  html:
+    toc: true
+    number-sections: false
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+# Code
+
+```{r}
+
+## =============================================================================
+## IDEA-RS temporal external validation in the 2004 Pelotas Birth Cohort
+##
+## Reproduces the analyses reported in the manuscript: exclusion cascade, Tables
+## 1-2, Figures 2-3, sensitivity analyses, attrition and missingness analyses,
+## and Supplementary Tables S3-S10 and Figures S1-S5.
+##
+## Inputs (in data/):
+##   Banco_IDEA_RS_idalt.dta
+##   Banco_IDEA_RS_idalt2.dta
+##   pelotas_2004_com_mania_raw.dta
+##
+## Outputs:
+##   results/       figures (.png) and one Excel workbook with all tables
+##   data/derived/  analytic datasets (.csv)
+##
+## Paths are relative to the folder containing this file. Quarto sets this
+## automatically; when running interactively, set the working directory to that
+## folder.
+## =============================================================================
+
+## ---- 1. Setup ---------------------------------------------------------------
+
+library(dplyr)
+library(tidyr)
+library(haven)
+library(labelled)
+library(readr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+library(pROC)
+library(patchwork)
+library(openxlsx)
+library(WeightedROC)
+
+set.seed(2024)
+dir.create("results", showWarnings = FALSE)
+dir.create("data/derived", recursive = TRUE, showWarnings = FALSE)
+
+## Colour used for the ROC curve and all calibration plots.
+PLOT_BLUE <- "blue"
+
+## Number of bootstrap replicates used throughout.
+N_BOOT <- 2000
+
+## ---- 2. Load raw data --------------------------------------------------------
+
+pelotas_2004_raw           <- read_dta("data/Banco_IDEA_RS_idalt.dta") %>% remove_var_label()
+pelotas_2004_com_mania_raw <- read_dta("data/pelotas_2004_com_mania_raw.dta") %>% remove_var_label()
+## Supplementary extract: IQ (age 6), SDQ (ages 11 and 15, parent-report), DAWBA
+## (age 11), and maternal education and household income at birth.
+pelotas_2004_extra_raw     <- read_dta("data/Banco_IDEA_RS_idalt2.dta") %>% remove_var_label()
+
+n_raw <- nrow(pelotas_2004_raw)
+cat(sprintf("Enrolled at birth: N = %d\n", n_raw))
+
+## jsmba6 (age-18 depression outcome) is kept out of predictor_15y_vars so that
+## completeness of the age-15 predictors can be assessed independently of
+## outcome availability.
+
+predictor_15y_vars <- c(
+  "asexo","acorpele",
+  "dcmadep","dcotdep","dcundif","icmadep","icotdep","icundif",
+  "hconff109","hconff110","hconff111","hconff112","hconff113","hconff114","hconff115",
+  "hconfb10a","hconfb10b","hconfb10c","hconfb10d","hconfb10f",
+  "hgh98","hgf58","hcmc38","hconfc48","hconfc49","hconfc51","hconfc53"
+)
+
+## Labels for the raw variable codes, used to report missingness per derived
+## predictor or questionnaire module (Table S4). The six DAWBA fields define the
+## baseline-depression exclusion and are not IDEA-RS predictors. The seven
+## maltreatment items and five drug-use items are each summed into one derived
+## predictor, so each group is reported as a single row.
+predictor_15y_var_groups <- c(
+  asexo = "Sex", acorpele = "Skin colour",
+  dcmadep = "Baseline depression screen (DAWBA) — exclusion criterion, not an IDEA-RS predictor",
+  dcotdep = "Baseline depression screen (DAWBA) — exclusion criterion, not an IDEA-RS predictor",
+  dcundif = "Baseline depression screen (DAWBA) — exclusion criterion, not an IDEA-RS predictor",
+  icmadep = "Baseline depression screen (DAWBA) — exclusion criterion, not an IDEA-RS predictor",
+  icotdep = "Baseline depression screen (DAWBA) — exclusion criterion, not an IDEA-RS predictor",
+  icundif = "Baseline depression screen (DAWBA) — exclusion criterion, not an IDEA-RS predictor",
+  hconff109 = "Childhood maltreatment", hconff110 = "Childhood maltreatment",
+  hconff111 = "Childhood maltreatment", hconff112 = "Childhood maltreatment",
+  hconff113 = "Childhood maltreatment", hconff114 = "Childhood maltreatment",
+  hconff115 = "Childhood maltreatment",
+  hconfb10a = "Any drug use", hconfb10b = "Any drug use", hconfb10c = "Any drug use",
+  hconfb10d = "Any drug use", hconfb10f = "Any drug use",
+  hgh98 = "School failure", hgf58 = "Social isolation", hcmc38 = "Fight involvement",
+  hconfc48 = "Ran away from home", hconfc49 = "Relationship with father",
+  hconfc51 = "Relationship with mother", hconfc53 = "Relationship between parents"
+)
+stopifnot(all(predictor_15y_vars %in% names(predictor_15y_var_groups)))
+
+core_vars <- c("idalt20241223", predictor_15y_vars, "jsmba6")
+
+## ---- 3. Puberty and mania status (merged onto every enrolled participant) ----
+
+puberty_boys <- pelotas_2004_raw %>%
+  filter(asexo == 1) %>%
+  transmute(idalt20241223,
+            puberty_data_present = !is.na(hconfmasce87) | !is.na(hconfmasce88),
+            puberty_started = (hconfmasce87 > 1 | hconfmasce88 > 1))
+
+puberty_girls <- pelotas_2004_raw %>%
+  filter(asexo == 2) %>%
+  transmute(idalt20241223,
+            puberty_data_present = !is.na(hconffeme87) | !is.na(hconffeme88),
+            puberty_started = (hconffeme87 > 1 | hconffeme88 > 1))
+
+puberty_status <- bind_rows(puberty_boys, puberty_girls)
+
+## jsmbb8/jsmbb9: manic/hypomanic episode flags from the MINI algorithm
+## (standard, not duration-corrected), ascertained at the age-18 interview.
+mania_status <- pelotas_2004_com_mania_raw %>%
+  transmute(idalt20241223,
+            mania_data_present = !is.na(jsmbb3),
+            ever_manic_hypomanic = (jsmbb8 == 1 | jsmbb9 == 1))
+
+## ---- 4. Main-analysis eligibility cascade -----------------------------------
+## Sequence: complete age-15 predictors -> no baseline (age-15) depression ->
+## puberty -> age-18 outcome available -> mania screening data available.
+## Lifetime mania/hypomania does not reduce N: these participants are retained
+## and recoded as non-cases (Section 8).
+##
+## eligibility_group separates exclusions by design (pre-pubertal or ambiguous
+## puberty status, baseline depression) from missing data (incomplete age-15
+## predictors, missing puberty data, missing age-18 outcome, missing mania
+## screen). It is used in Section 7B and in the IPW models.
+
+## DAWBA fields (age 15: dc*/ic*; age 11: gdc*/gic*) are scored positive if
+## they are not 0. Values are checked against the observed banding (0-4), so an
+## unexpected code (e.g. a negative sentinel, which would read as positive)
+## fails loudly.
+dawba_fields_15y <- pelotas_2004_raw %>% select(dcmadep, dcotdep, dcundif, icmadep, icotdep, icundif)
+dawba_fields_11y <- pelotas_2004_extra_raw %>% select(gdcmadep, gdcotdep, gdcundif, gicmadep, gicotdep, gicundif)
+stopifnot(
+  all(vapply(dawba_fields_15y, function(x) all(x[!is.na(x)] %in% c(0, 1, 2, 3, 4)), logical(1))),
+  all(vapply(dawba_fields_11y, function(x) all(x[!is.na(x)] %in% c(0, 1, 2, 3, 4)), logical(1)))
+)
+
+status_data <- pelotas_2004_raw %>%
+  select(all_of(core_vars)) %>%
+  left_join(puberty_status, by = "idalt20241223", relationship = "one-to-one") %>%
+  left_join(mania_status, by = "idalt20241223", relationship = "one-to-one") %>%
+  mutate(
+    missing_15y_data = if_any(all_of(predictor_15y_vars), is.na),
+    baseline_depression = ifelse(
+      !missing_15y_data,
+      as.integer(dcmadep != 0 | dcotdep != 0 | dcundif != 0 | icmadep != 0 | icotdep != 0 | icundif != 0),
+      NA_integer_
+    ),
+    missing_18y_outcome = is.na(jsmba6),
+    eligibility_status = case_when(
+      missing_15y_data                      ~ "Excluded: missing 15y predictor/baseline-diagnosis data",
+      !(puberty_data_present %in% TRUE)     ~ "Excluded: missing puberty data",
+      is.na(puberty_started)                ~ "Excluded: ambiguous puberty status",
+      !(puberty_started %in% TRUE)          ~ "Excluded: pre-pubertal at 15y",
+      baseline_depression == 1              ~ "Excluded: baseline (15y) depression",
+      missing_18y_outcome                   ~ "Excluded: missing 18y depression outcome (additional loss to follow-up)",
+      !(mania_data_present %in% TRUE)       ~ "Excluded: missing mania/hypomania screening data",
+      TRUE                                   ~ "Included: valid case"
+    ),
+    eligibility_group = case_when(
+      eligibility_status == "Included: valid case" ~ "Included (final validation sample)",
+      eligibility_status %in% c("Excluded: missing 15y predictor/baseline-diagnosis data",
+                                 "Excluded: missing puberty data",
+                                 "Excluded: ambiguous puberty status",
+                                 "Excluded: missing 18y depression outcome (additional loss to follow-up)",
+                                 "Excluded: missing mania/hypomania screening data") ~ "Excluded (missing data / attrition)",
+      TRUE ~ "Excluded (by design / eligibility criterion)"
+    )
+  )
+stopifnot(nrow(status_data) == n_raw)
+
+## Attach the supplementary variables (used for Tables S5-S6, the IPW model and
+## Sensitivities 2-4).
+status_data <- status_data %>%
+  left_join(
+    pelotas_2004_extra_raw %>%
+      select(idalt20241223, aescmae4cat, arendsm, fqiwiscstd,
+             p1somatic_11, p1worries_11, p1unhappy_11, p1clingy_11, p1afraid_11,
+             p1somatic_15, p1worries_15, p1unhappy_15, p1clingy_15, p1afraid_15,
+             gdcmadep, gdcotdep, gdcundif, gicmadep, gicotdep, gicundif),
+    by = "idalt20241223", relationship = "one-to-one"
+  )
+stopifnot(nrow(status_data) == n_raw)
+
+## ---- 5. Sequential counts for the flow table ---------------------------------
+
+n_total                 <- nrow(status_data)
+n_after_15y             <- sum(!status_data$missing_15y_data)
+n_after_puberty_data    <- sum(!status_data$missing_15y_data &
+                                  status_data$puberty_data_present %in% TRUE)
+n_after_puberty_unambig <- sum(!status_data$missing_15y_data &
+                                  status_data$puberty_data_present %in% TRUE &
+                                  !is.na(status_data$puberty_started))
+n_after_puberty         <- sum(!status_data$missing_15y_data &
+                                  status_data$puberty_started %in% TRUE)
+n_after_dep             <- sum(!status_data$missing_15y_data &
+                                  status_data$puberty_started %in% TRUE &
+                                  status_data$baseline_depression == 0)
+n_15y_eligible          <- n_after_dep
+n_18y_outcome_available <- sum(!status_data$missing_15y_data & status_data$baseline_depression == 0 &
+                                  status_data$puberty_started %in% TRUE &
+                                  !status_data$missing_18y_outcome)
+n_additional_18y_loss    <- n_15y_eligible - n_18y_outcome_available
+n_mania_data_available   <- sum(!status_data$missing_15y_data & status_data$baseline_depression == 0 &
+                                  status_data$puberty_started %in% TRUE &
+                                  !status_data$missing_18y_outcome &
+                                  status_data$mania_data_present %in% TRUE)
+n_final                  <- n_mania_data_available
+n_mania_recoded_nonMDD   <- sum(!status_data$missing_15y_data & status_data$baseline_depression == 0 &
+                                  status_data$puberty_started %in% TRUE &
+                                  !status_data$missing_18y_outcome &
+                                  status_data$mania_data_present %in% TRUE &
+                                  status_data$ever_manic_hypomanic %in% TRUE)
+
+flow_table <- tibble(
+  Step = c(
+    "Enrolled at birth",
+    "Complete 15-year data: sex, ethnicity, predictors, baseline diagnosis",
+    "Puberty (Tanner staging) data available",
+    "Excluding ambiguous puberty status (partial Tanner data)",
+    "Excluding pre-pubertal at 15y",
+    "Excluding baseline (15y) depression  ->  15-year-eligible sample",
+    "Excluding additional loss to follow-up: missing 18-year depression outcome",
+    "Excluding missing mania/hypomania screening data  ->  Final validation sample"
+  ),
+  n_remaining = c(n_total, n_after_15y, n_after_puberty_data,
+                   n_after_puberty_unambig, n_after_puberty, n_15y_eligible,
+                   n_18y_outcome_available, n_final),
+  n_excluded_this_step = c(
+    NA,
+    n_total - n_after_15y,
+    n_after_15y - n_after_puberty_data,
+    n_after_puberty_data - n_after_puberty_unambig,
+    n_after_puberty_unambig - n_after_puberty,
+    n_after_puberty - n_15y_eligible,
+    n_additional_18y_loss,
+    n_18y_outcome_available - n_final
+  )
+)
+print(flow_table)
+
+## ---- 6. Baseline-depression exclusion: 1993 vs. 2004 ------------------------
+## 1993 counts are taken from the published flowchart (Rocha et al., 2021,
+## Figure 1a); the 1993 raw data are not used here.
+
+baseline_depression_exclusion <- tibble(
+  Cohort = c("Pelotas 1993 (development)", "Pelotas 2004 (this validation)"),
+  Screening_instrument = c(
+    "SDQ emotional subscale, OR rule across self- and parent-report at ages 11 and 15 (3 informant-timepoints)",
+    "DAWBA, caregiver-report only, single wave (age 15)"
+  ),
+  N_with_screening_data = c(3365L, as.integer(n_after_puberty)),
+  N_excluded_positive_screen = c(904L, as.integer(n_after_puberty - n_after_dep)),
+  Pct_excluded = round(c(
+    100 * 904 / 3365,
+    100 * (n_after_puberty - n_after_dep) / n_after_puberty
+  ), 1),
+  Source = c("Rocha et al. (2021), Figure 1a", "This analysis (see flow table above)")
+)
+cat("\n--- Baseline-depression exclusion, 1993 vs. 2004 ---\n")
+print(baseline_depression_exclusion)
+
+cat(sprintf(
+  "\n*** 15-year-eligible sample: N = %d ***\n*** Of these, additional loss to follow-up at 18y (missing depression outcome): n = %d ***\n*** 18-year outcome available: N = %d ***\n*** Final validation sample: N = %d ***\n*** Of these, lifetime manic/hypomanic episode (18y, standard MINI criteria): n = %d -- recoded as NOT having MDD (outcome = 0), fully retained, NOT excluded ***\n",
+  n_15y_eligible, n_additional_18y_loss, n_18y_outcome_available, n_final, n_mania_recoded_nonMDD
+))
+
+## ---- 7A. Attrition and missing-data analyses --------------------------------
+## A. Missingness of the age-15 predictors vs. the age-18 depression outcome.
+## B. Additional loss to follow-up between ages 15 and 18 vs. sex, skin colour
+## and the 11 IDEA-RS predictors (age-15-eligible sample).
+## C. Retention in the final sample vs. sex, skin colour, maternal education and
+## household income (full birth cohort).
+
+## -- Section A --
+missingness_outcome_data <- pelotas_2004_raw %>%
+  mutate(any_predictor_missing = if_any(all_of(predictor_15y_vars), is.na)) %>%
+  filter(!is.na(jsmba6))
+
+chisq_missing_outcome <- chisq.test(table(missingness_outcome_data$any_predictor_missing,
+                                            missingness_outcome_data$jsmba6))
+
+## -- Section B --
+eligible_15y_data <- status_data %>%
+  filter(!missing_15y_data & baseline_depression == 0 & puberty_started %in% TRUE)
+
+chisq_18yloss_sex <- chisq.test(table(eligible_15y_data$asexo, eligible_15y_data$missing_18y_outcome))
+chisq_18yloss_eth <- chisq.test(table(
+  eligible_15y_data$acorpele[!is.na(eligible_15y_data$acorpele)],
+  eligible_15y_data$missing_18y_outcome[!is.na(eligible_15y_data$acorpele)]
+))
+
+eligible_15y_data <- eligible_15y_data %>%
+  mutate(
+    drugs_pos     = as.integer(hconfb10a == 1 | hconfb10b == 1 | hconfb10c == 1 | hconfb10d == 1 | hconfb10f == 1),
+    school_pos    = as.integer(hgh98 == 1),
+    isolation_pos = as.integer(hgf58 == 0),
+    fighting_pos  = as.integer(hcmc38 == 1),
+    ranaway_pos   = as.integer(hconfc48 == 1),
+    maltreat_sum  = hconff109 + hconff110 + hconff111 + hconff112 + hconff113 + hconff114 + hconff115,
+    maltreat_cat  = case_when(maltreat_sum == 0 ~ "None", maltreat_sum == 1 ~ "Probable", maltreat_sum >= 2 ~ "Severe"),
+    rel_mother_cat  = ifelse(hconfc51 == 6, 5, as.numeric(hconfc51)),
+    rel_father_cat  = ifelse(hconfc49 == 6, 5, as.numeric(hconfc49)),
+    rel_between_cat = ifelse(hconfc53 == 6, 5, as.numeric(hconfc53))
+  )
+
+attrition_predictor_vars <- list(
+  "Drug use"                      = eligible_15y_data$drugs_pos,
+  "School failure"                = eligible_15y_data$school_pos,
+  "Social isolation"              = eligible_15y_data$isolation_pos,
+  "Fight involvement"             = eligible_15y_data$fighting_pos,
+  "Ran away from home"            = eligible_15y_data$ranaway_pos,
+  "Childhood maltreatment"        = eligible_15y_data$maltreat_cat,
+  "Relationship with mother"      = eligible_15y_data$rel_mother_cat,
+  "Relationship with father"      = eligible_15y_data$rel_father_cat,
+  "Relationship between parents"  = eligible_15y_data$rel_between_cat
+)
+
+attrition_predictor_checks <- purrr::imap_dfr(attrition_predictor_vars, function(v, name) {
+  tst <- chisq.test(table(v, eligible_15y_data$missing_18y_outcome))
+  tibble(Comparison = name, Chi_sq = round(unname(tst$statistic), 3),
+         df = unname(tst$parameter), p_value = round(tst$p.value, 3))
+})
+
+## -- Section C --
+baseline_attrition_data <- status_data %>%
+  mutate(
+    in_final_sample = eligibility_status == "Included: valid case",
+    income_quartile = ntile(arendsm, 4)
+  )
+
+chisq_baseline_sex <- chisq.test(table(baseline_attrition_data$asexo, baseline_attrition_data$in_final_sample))
+chisq_baseline_eth <- chisq.test(table(
+  baseline_attrition_data$acorpele[!is.na(baseline_attrition_data$acorpele)],
+  baseline_attrition_data$in_final_sample[!is.na(baseline_attrition_data$acorpele)]
+))
+## Participants with missing maternal education are left out of this test (not
+## imputed), as for skin colour.
+chisq_baseline_educ <- chisq.test(table(
+  baseline_attrition_data$aescmae4cat[!is.na(baseline_attrition_data$aescmae4cat)],
+  baseline_attrition_data$in_final_sample[!is.na(baseline_attrition_data$aescmae4cat)]
+))
+chisq_baseline_income <- chisq.test(table(
+  baseline_attrition_data$income_quartile[!is.na(baseline_attrition_data$income_quartile)],
+  baseline_attrition_data$in_final_sample[!is.na(baseline_attrition_data$income_quartile)]
+))
+
+attrition_chisq_tests <- bind_rows(
+  tibble(
+    Section = "A. Missingness on the age-15 predictor block vs. the 18-year depression outcome (among participants with an observed 18-year diagnosis)",
+    Comparison = "Any predictor missing vs. depression outcome",
+    Chi_sq = round(unname(chisq_missing_outcome$statistic), 3),
+    df = unname(chisq_missing_outcome$parameter),
+    p_value = round(chisq_missing_outcome$p.value, 3)
+  ),
+  tibble(
+    Section = "B. Additional loss to follow-up between the 15- and 18-year waves (among the 15-year-eligible sample)",
+    Comparison = "Sex",
+    Chi_sq = round(unname(chisq_18yloss_sex$statistic), 3),
+    df = unname(chisq_18yloss_sex$parameter),
+    p_value = round(chisq_18yloss_sex$p.value, 3)
+  ),
+  tibble(
+    Section = "B. Additional loss to follow-up between the 15- and 18-year waves (among the 15-year-eligible sample)",
+    Comparison = "Skin colour",
+    Chi_sq = round(unname(chisq_18yloss_eth$statistic), 3),
+    df = unname(chisq_18yloss_eth$parameter),
+    p_value = round(chisq_18yloss_eth$p.value, 3)
+  ),
+  attrition_predictor_checks %>% mutate(Section = "B. Additional loss to follow-up between the 15- and 18-year waves (among the 15-year-eligible sample)", .before = 1),
+  tibble(
+    Section = "C. Retention in the final analytic sample vs. exclusion at any step (full birth cohort, N=4,231)",
+    Comparison = "Sex",
+    Chi_sq = round(unname(chisq_baseline_sex$statistic), 3),
+    df = unname(chisq_baseline_sex$parameter),
+    p_value = round(chisq_baseline_sex$p.value, 3)
+  ),
+  tibble(
+    Section = "C. Retention in the final analytic sample vs. exclusion at any step (full birth cohort, N=4,231)",
+    Comparison = "Skin colour",
+    Chi_sq = round(unname(chisq_baseline_eth$statistic), 3),
+    df = unname(chisq_baseline_eth$parameter),
+    p_value = round(chisq_baseline_eth$p.value, 3)
+  ),
+  tibble(
+    Section = "C. Retention in the final analytic sample vs. exclusion at any step (full birth cohort, N=4,231)",
+    Comparison = "Maternal education (4 categories)",
+    Chi_sq = round(unname(chisq_baseline_educ$statistic), 3),
+    df = unname(chisq_baseline_educ$parameter),
+    p_value = round(chisq_baseline_educ$p.value, 3)
+  ),
+  tibble(
+    Section = "C. Retention in the final analytic sample vs. exclusion at any step (full birth cohort, N=4,231)",
+    Comparison = "Household income (quartiles)",
+    Chi_sq = round(unname(chisq_baseline_income$statistic), 3),
+    df = unname(chisq_baseline_income$parameter),
+    p_value = round(chisq_baseline_income$p.value, 3)
+  )
+)
+cat("\n--- Attrition chi-sq tests (diagnostic, not in manuscript) ---\n")
+print(attrition_chisq_tests, n = Inf)
+
+## ---- 7B. Eligibility and missingness tables (Tables S3 and S4) --------------
+## Table S3: every exclusion reason in the cascade, tagged as an eligibility
+## criterion (by design) or as missing data / attrition.
+eligibility_summary <- status_data %>%
+  count(eligibility_group, eligibility_status, name = "n") %>%
+  mutate(pct_of_birth_cohort = round(100 * n / n_total, 1)) %>%
+  arrange(eligibility_group) %>%
+  rename(`Eligibility group` = eligibility_group, Status = eligibility_status,
+         N = n, `% of birth cohort` = pct_of_birth_cohort)
+cat("\n--- Table S3: eligibility (intentional exclusion) vs. attrition (non-observation), full cascade ---\n")
+print(eligibility_summary, n = Inf)
+
+## Table S4: missingness of each age-15 predictor, puberty status and the
+## baseline-depression screen, and its association with the age-18 outcome. One
+## row per derived predictor or questionnaire module; the six DAWBA fields,
+## seven maltreatment items and five drug-use items are each collapsed into one
+## row. A module is coded missing if any of its items is missing. Puberty status
+## is reported alongside the DAWBA screen because both are exclusion criteria
+## rather than predictors.
+predictor_groups_ordered <- c(
+  "Sex", "Skin colour",
+  "Baseline depression screen (DAWBA) — exclusion criterion, not an IDEA-RS predictor",
+  "Childhood maltreatment", "Any drug use", "School failure", "Social isolation",
+  "Fight involvement", "Ran away from home", "Relationship with father",
+  "Relationship with mother", "Relationship between parents"
+)
+stopifnot(setequal(predictor_groups_ordered, unique(predictor_15y_var_groups)))
+
+## Fixed-decimal formatting, so every row shows the same number of decimals.
+## p-values are floored at "<0.001"; "—" is shown where no test is possible.
+format_stat <- function(x, digits = 3) ifelse(is.na(x), "—", sprintf(paste0("%.", digits, "f"), x))
+format_p_em <- function(x) ifelse(is.na(x), "—", ifelse(x < 0.001, "<0.001", sprintf("%.3f", x)))
+
+## Shared by the predictor loop and the puberty row. N_total is the same for
+## every row (participants with an observed age-18 outcome).
+run_missingness_test <- function(is_missing, outcome) {
+  d <- tibble(missing = is_missing, outcome = outcome) %>% filter(!is.na(outcome))
+  n_total <- nrow(d)
+  n_miss  <- sum(d$missing)
+  ## With 0% or 100% missingness there is nothing to test (chisq.test() on a
+  ## one-row table would run a goodness-of-fit test), so that case is excluded
+  ## explicitly.
+  tst <- if (n_miss > 0 && n_miss < n_total) {
+    tryCatch(chisq.test(table(d$missing, d$outcome)), error = function(e) NULL)
+  } else {
+    NULL
+  }
+  tibble(
+    N_total = n_total,
+    N_missing = n_miss,
+    Pct_missing = round(100 * n_miss / n_total, 1),
+    Chi_sq = if (!is.null(tst)) format_stat(unname(tst$statistic)) else "—",
+    df = if (!is.null(tst)) as.character(unname(tst$parameter)) else "—",
+    p_value = if (!is.null(tst)) format_p_em(tst$p.value) else "—"
+  )
+}
+
+predictor_missingness_by_var <- purrr::map_dfr(predictor_groups_ordered, function(g) {
+  vars_in_group <- names(predictor_15y_var_groups)[predictor_15y_var_groups == g]
+  na_mat <- is.na(as.data.frame(pelotas_2004_raw)[, vars_in_group, drop = FALSE])
+  is_missing <- if (ncol(na_mat) == 1) na_mat[, 1] else apply(na_mat, 1, any)
+  bind_cols(
+    tibble(Variable = if (length(vars_in_group) > 1) sprintf("%s (%d items)", g, length(vars_in_group)) else g),
+    run_missingness_test(is_missing, pelotas_2004_raw$jsmba6)
+  )
+})
+
+## Puberty status (Tanner stage) is derived from sex-specific fields
+## (hconfmasce87/88 for boys, hconffeme87/88 for girls; see Section 3), so it is
+## computed separately from the generic loop.
+puberty_missing_vec <- with(pelotas_2004_raw, ifelse(
+  asexo == 1, is.na(hconfmasce87) & is.na(hconfmasce88),
+  ifelse(asexo == 2, is.na(hconffeme87) & is.na(hconffeme88), NA)
+))
+stopifnot(!anyNA(puberty_missing_vec))  # asexo is 1 or 2 for every participant
+puberty_row <- bind_cols(
+  tibble(Variable = "Puberty status (Tanner stage) — exclusion criterion, not an IDEA-RS predictor"),
+  run_missingness_test(puberty_missing_vec, pelotas_2004_raw$jsmba6)
+)
+
+## Puberty row inserted after Skin colour and before the DAWBA row, following
+## the order of the exclusion criteria in the Methods.
+predictor_missingness_by_var <- bind_rows(
+  predictor_missingness_by_var[1:2, ],
+  puberty_row,
+  predictor_missingness_by_var[3:nrow(predictor_missingness_by_var), ]
+)
+
+stopifnot(length(unique(predictor_missingness_by_var$N_total)) == 1)  # denominator must be constant across rows
+table_s4_total_n <- predictor_missingness_by_var$N_total[1]
+predictor_missingness_by_var <- predictor_missingness_by_var %>%
+  select(-N_total) %>%
+  rename(`N missing` = N_missing, `% missing` = Pct_missing, `χ²` = Chi_sq, `p value` = p_value)
+
+cat(sprintf("\n--- Table S4: missingness by predictor (age-15 block, grouped by questionnaire module) vs. 18-year outcome (N=%d) ---\n", table_s4_total_n))
+print(predictor_missingness_by_var, n = Inf, width = Inf)
+
+## ---- 8. Final analytic dataset (main analysis) ------------------------------
+## All participants with mania screening data (N = n_final). A lifetime
+## manic/hypomanic episode does not remove anyone: depression_outcome is set to
+## 0.
+
+## Applies the predictor recoding and outcome definition to any set of subject
+## IDs, so the main analysis and every sensitivity sample share one
+## implementation.
+build_analytic_dataset <- function(ids) {
+  d <- status_data %>% filter(idalt20241223 %in% ids)
+
+  ## Each maltreatment item must be 0/1 (summed into none / probable / severe);
+  ## a miscoded value fails loudly.
+  maltreat_items <- d %>% select(hconff109, hconff110, hconff111, hconff112, hconff113, hconff114, hconff115)
+  stopifnot(all(vapply(maltreat_items, function(x) all(x %in% c(0, 1)), logical(1))))
+
+  d %>%
+    mutate(
+      maltreatment_sum = hconff109 + hconff110 + hconff111 + hconff112 + hconff113 + hconff114 + hconff115,
+      maltreatment = case_when(
+        maltreatment_sum == 0 ~ 0,
+        maltreatment_sum == 1 ~ 1,
+        maltreatment_sum >= 2 ~ 2
+      ),
+      drugs = ifelse(hconfb10a == 1 | hconfb10b == 1 | hconfb10c == 1 | hconfb10d == 1 | hconfb10f == 1, 1, 0),
+      sex = ifelse(asexo == 2, 1, 0),
+      ## Skin colour: acorpele, caregiver-reported at the age-6 wave (4
+      ## categories; 1 = white), the only skin-colour variable in the 2004 data
+      ## files.
+      ethnicity = ifelse(acorpele == 1, 0, 1),
+      ## Social isolation: hgf58 == 0, as in the 1993 item (Rocha et al., 2021,
+      ## Table S1).
+      social_isolation = ifelse(hgf58 == 0, 1, 0),
+      ## School failure, fighting and running away are coded 1 = yes on their
+      ## raw scales and are dichotomised here before entering the linear
+      ## predictor.
+      school_failure = as.integer(hgh98 == 1),
+      fighting = as.integer(hcmc38 == 1),
+      ran_away = as.integer(hconfc48 == 1),
+
+      ## Raw relationship categories (1-6), kept for Table 1.
+      rel_mother_raw  = as.numeric(hconfc51),
+      rel_father_raw  = as.numeric(hconfc49),
+      rel_between_raw = as.numeric(hconfc53),
+
+      ## Main analysis: "no father / mother / parental figure present" (code 6)
+      ## is recoded to "bad" (5).
+      father_recoded_to_ref  = hconfc49 == 6,
+      mother_recoded_to_ref  = hconfc51 == 6,
+      between_recoded_to_ref = hconfc53 == 6,
+      rel_mother_cat  = ifelse(hconfc51 == 6, 5, as.numeric(hconfc51)),
+      rel_father_cat  = ifelse(hconfc49 == 6, 5, as.numeric(hconfc49)),
+      rel_between_cat = ifelse(hconfc53 == 6, 5, as.numeric(hconfc53)),
+
+      ## Lifetime manic/hypomanic episode (standard MINI criteria): recoded as a
+      ## non-case (0) and retained.
+      depression_outcome = ifelse(ever_manic_hypomanic %in% TRUE, 0, as.numeric(jsmba6))
+    ) %>%
+    select(
+      subject_id = idalt20241223,
+      sex, ethnicity, drugs, maltreatment,
+      school_failure, social_isolation, fighting, ran_away,
+      rel_mother_cat, rel_father_cat, rel_between_cat,
+      rel_mother_raw, rel_father_raw, rel_between_raw,
+      father_recoded_to_ref, mother_recoded_to_ref, between_recoded_to_ref,
+      ever_manic_hypomanic,
+      depression_outcome
+    )
+}
+
+main_ids <- status_data %>% filter(eligibility_status == "Included: valid case") %>% pull(idalt20241223)
+pel_2004_desc <- build_analytic_dataset(main_ids)
+
+pel_2004_valid <- pel_2004_desc %>% filter(!is.na(depression_outcome))
+
+write_csv(pel_2004_desc,  "data/derived/pelotas_2004_desc.csv")
+write_csv(pel_2004_valid, "data/derived/pelotas_2004_valid.csv")
+
+n_analytic <- nrow(pel_2004_valid)
+n_events   <- sum(pel_2004_valid$depression_outcome)
+prev_pct   <- round(100 * n_events / n_analytic, 1)
+cat(sprintf("\nFinal validation sample: N = %d | Events = %d (%.1f%%)\n", n_analytic, n_events, prev_pct))
+stopifnot(n_analytic == n_final, nrow(pel_2004_desc) == length(main_ids))
+
+recode_summary <- pel_2004_valid %>%
+  summarise(
+    n_analytic         = n(),
+    n_father_recoded   = sum(father_recoded_to_ref),
+    n_mother_recoded   = sum(mother_recoded_to_ref),
+    n_between_recoded  = sum(between_recoded_to_ref),
+    n_any_recoded      = sum(father_recoded_to_ref | mother_recoded_to_ref | between_recoded_to_ref)
+  )
+cat("\n--- 'No parent figure' recoded to BAD (main analysis), within final validation sample ---\n")
+print(recode_summary)
+
+## ---- 9. Table 1: predictor distributions ------------------------------------
+## 1993 counts are the published counts from Rocha et al. (2021), Table 1 (J Am
+## Acad Child Adolesc Psychiatry 60(2):262-273).
+
+n_1993 <- 2192
+n_2004 <- nrow(pel_2004_valid)
+
+test_binary_exact <- function(n1993_pos, n2004_pos, n2004_total) {
+  tab <- matrix(c(n1993_pos, n_1993 - n1993_pos,
+                  n2004_pos, n2004_total - n2004_pos), nrow = 2, byrow = TRUE)
+  tryCatch(chisq.test(tab)$p.value, error = function(e) NA_real_)
+}
+
+test_grouped_exact <- function(n1993_vec, n2004_vec) {
+  tab <- rbind(n1993_vec, n2004_vec)
+  tryCatch(chisq.test(tab)$p.value, error = function(e) NA_real_)
+}
+
+format_p <- function(p) {
+  case_when(
+    is.na(p)   ~ "-",
+    p < 0.001  ~ "<0.001",
+    TRUE       ~ sprintf("%.3f", p)
+  )
+}
+
+fmt_n_pct <- function(n, pct) {
+  ifelse(is.na(n), "-", sprintf("%d (%.1f%%)", as.integer(n), pct))
+}
+
+binary_defs <- tribble(
+  ~Predictor,                        ~n_1993_exact, ~var_2004,           ~positive_value,
+  "Female sex",                       1215,          "sex",                1,
+  "Non-white skin color",              714,          "ethnicity",          1,
+  "School failure (grade retention)", 1127,          "school_failure",     1,
+  "Social isolation",                  231,          "social_isolation",   1,
+  "Fight involvement",                 211,          "fighting",           1,
+  "Ran away from home",                 80,          "ran_away",           1,
+  "Any drug use",                     1367,          "drugs",              1
+)
+
+table1_binary <- binary_defs %>%
+  rowwise() %>%
+  mutate(
+    n2004_pos = sum(pel_2004_valid[[var_2004]] == positive_value),
+    Pelotas_2004_pct = round(100 * n2004_pos / n_2004, 1),
+    Pelotas_1993_pct = round(100 * n_1993_exact / n_1993, 1),
+    p_value = test_binary_exact(n_1993_exact, n2004_pos, n_2004)
+  ) %>%
+  ungroup() %>%
+  transmute(
+    Group = Predictor, Category = NA_character_,
+    Pelotas_1993_n = n_1993_exact, Pelotas_1993_pct,
+    Pelotas_2004_n = n2004_pos, Pelotas_2004_pct,
+    p_value_fmt = format_p(p_value)
+  )
+
+malt_1993_n <- c(None = 1539, Probable = 390, Severe = 263)
+malt_2004_n <- c(
+  None     = sum(pel_2004_valid$maltreatment == 0),
+  Probable = sum(pel_2004_valid$maltreatment == 1),
+  Severe   = sum(pel_2004_valid$maltreatment == 2)
+)
+malt_p <- test_grouped_exact(malt_1993_n, malt_2004_n)
+
+table1_maltreatment <- tibble(
+  Group = "Childhood maltreatment",
+  Category = names(malt_1993_n),
+  Pelotas_1993_n = as.integer(malt_1993_n), Pelotas_1993_pct = round(100 * malt_1993_n / n_1993, 1),
+  Pelotas_2004_n = as.integer(malt_2004_n), Pelotas_2004_pct = round(100 * malt_2004_n / n_2004, 1),
+  p_value_fmt = c(format_p(malt_p), "", "")
+)
+
+build_rel_group_full <- function(group_label, var_2004_raw, n1993_vec5, label_6) {
+  cats <- c(Great = 1, `Very good` = 2, Good = 3, Regular = 4, Bad = 5)
+  n2004_vec5 <- sapply(cats, function(v) sum(pel_2004_valid[[var_2004_raw]] == v, na.rm = TRUE))
+  n2004_cat6 <- sum(pel_2004_valid[[var_2004_raw]] == 6, na.rm = TRUE)
+  n2004_vec6 <- c(n2004_vec5, n2004_cat6)
+  ## The chi-square test compares the five-category distribution, with the 2004
+  ## sixth category ("no figure present") folded into "Bad" as in build_lp().
+  ## 1993 has no sixth category, so including it would test against a structural
+  ## zero.
+  n2004_vec5_recoded <- n2004_vec5
+  n2004_vec5_recoded["Bad"] <- n2004_vec5_recoded["Bad"] + n2004_cat6
+  p <- test_grouped_exact(n1993_vec5, n2004_vec5_recoded)
+  tibble(
+    Group = group_label,
+    Category = c(names(cats), label_6),
+    Pelotas_1993_n = c(n1993_vec5, NA), Pelotas_1993_pct = c(round(100 * n1993_vec5 / n_1993, 1), NA),
+    Pelotas_2004_n = as.integer(n2004_vec6), Pelotas_2004_pct = round(100 * n2004_vec6 / n_2004, 1),
+    p_value_fmt = c(format_p(p), rep("", 5))
+  )
+}
+
+table1_mother  <- build_rel_group_full("Relationship with mother",     "rel_mother_raw",
+                                        c(1417, 430, 264, 68, 13),   "No mother or maternal figure present")
+table1_father  <- build_rel_group_full("Relationship with father",     "rel_father_raw",
+                                        c(1019, 434, 370, 237, 132), "No father or paternal figure present")
+table1_between <- build_rel_group_full("Relationship between parents", "rel_between_raw",
+                                        c(886, 421, 404, 301, 180),  "No parental figure present")
+
+table1_outcome <- tibble(
+  Group = "Depression prevalence at outcome assessment", Category = NA_character_,
+  Pelotas_1993_n = 69L, Pelotas_1993_pct = round(100 * 69 / n_1993, 1),
+  Pelotas_2004_n = n_events, Pelotas_2004_pct = prev_pct,
+  p_value_fmt = ""
+)
+
+table1_final <- bind_rows(
+  table1_binary %>% filter(Group %in% c("Female sex", "Non-white skin color")),
+  table1_maltreatment,
+  table1_binary %>% filter(!Group %in% c("Female sex", "Non-white skin color"))
+) %>%
+  mutate(Row_label = ifelse(is.na(Category), Group, paste0("  ", Category))) %>%
+  bind_rows(table1_mother, table1_father, table1_between) %>%
+  mutate(Row_label = ifelse(is.na(Category), Group, paste0("  ", Category))) %>%
+  bind_rows(table1_outcome %>% mutate(Row_label = Group)) %>%
+  mutate(
+    `Pelotas 1993 (N=2,192), n (%)` = fmt_n_pct(Pelotas_1993_n, Pelotas_1993_pct),
+    `Pelotas 2004 (N=1,562), n (%)` = fmt_n_pct(Pelotas_2004_n, Pelotas_2004_pct)
+  ) %>%
+  select(Group, Row_label, `Pelotas 1993 (N=2,192), n (%)`, `Pelotas 2004 (N=1,562), n (%)`, `p-value` = p_value_fmt)
+
+print(table1_final, n = Inf)
+
+## ---- 10. Model coefficients (Rocha et al., 2021) -----------------------------
+## Coefficients of the published IDEA-RS model, estimated by penalised maximum
+## likelihood (PMLE).
+
+coef_pmle <- list(
+  intercept = -4.642, sex = 0.325, ethnicity = -0.030, school_failure = 0.290, drugs = 0.121,
+  social_isolation = 0.127, fighting = 0.580, ran_away = -0.017,
+  maltreatment_prob = 0.422, maltreatment_severe = 0.652,
+  mom_2 = 0.054, mom_3 = 0.161, mom_4 = -0.026, mom_5 = 0.006,
+  dad_2 = -0.010, dad_3 = 0.297, dad_4 = 0.181, dad_5 = 0.237,
+  btw_2 = -0.004, btw_3 = 0.251, btw_4 = 0.163, btw_5 = 0.037,
+  sex_x_ethnicity = 0.170, sex_x_school_fail = 0.114, sex_x_drugs = 0.108, sex_x_social_iso = 0.269,
+  sex_x_fighting = -0.395, sex_x_ran_away = -0.101, sex_x_prob_malt = 0.369, sex_x_severe_malt = 0.382,
+  sex_x_mom_2 = -0.219, sex_x_mom_3 = 0.060, sex_x_mom_4 = -0.203, sex_x_mom_5 = -1.293,
+  sex_x_dad_2 = 0.143, sex_x_dad_3 = -0.279, sex_x_dad_4 = -0.103, sex_x_dad_5 = 0.537,
+  sex_x_btw_2 = 0.011, sex_x_btw_3 = -0.035, sex_x_btw_4 = 0.158, sex_x_btw_5 = 0.075
+)
+
+## ---- 11. Reusable linear-predictor builder -----------------------------------
+
+build_lp <- function(data) {
+  data %>%
+    mutate(
+      mom_2 = as.integer(rel_mother_cat == 2), mom_3 = as.integer(rel_mother_cat == 3),
+      mom_4 = as.integer(rel_mother_cat == 4), mom_5 = as.integer(rel_mother_cat == 5),
+      dad_2 = as.integer(rel_father_cat == 2), dad_3 = as.integer(rel_father_cat == 3),
+      dad_4 = as.integer(rel_father_cat == 4), dad_5 = as.integer(rel_father_cat == 5),
+      btw_2 = as.integer(rel_between_cat == 2), btw_3 = as.integer(rel_between_cat == 3),
+      btw_4 = as.integer(rel_between_cat == 4), btw_5 = as.integer(rel_between_cat == 5),
+      maltreatment_prob   = ifelse(maltreatment == 1, 1, 0),
+      maltreatment_severe = ifelse(maltreatment == 2, 1, 0),
+      across(c(sex, ethnicity, school_failure, drugs, social_isolation, fighting, ran_away, depression_outcome), as.numeric)
+    ) %>%
+    mutate(
+      lp = coef_pmle$intercept +
+        coef_pmle$sex * sex + coef_pmle$ethnicity * ethnicity + coef_pmle$school_failure * school_failure +
+        coef_pmle$drugs * drugs + coef_pmle$social_isolation * social_isolation + coef_pmle$fighting * fighting +
+        coef_pmle$ran_away * ran_away +
+        coef_pmle$maltreatment_prob * maltreatment_prob + coef_pmle$maltreatment_severe * maltreatment_severe +
+        coef_pmle$mom_2*mom_2 + coef_pmle$mom_3*mom_3 + coef_pmle$mom_4*mom_4 + coef_pmle$mom_5*mom_5 +
+        coef_pmle$dad_2*dad_2 + coef_pmle$dad_3*dad_3 + coef_pmle$dad_4*dad_4 + coef_pmle$dad_5*dad_5 +
+        coef_pmle$btw_2*btw_2 + coef_pmle$btw_3*btw_3 + coef_pmle$btw_4*btw_4 + coef_pmle$btw_5*btw_5 +
+        coef_pmle$sex_x_ethnicity*sex*ethnicity + coef_pmle$sex_x_school_fail*sex*school_failure +
+        coef_pmle$sex_x_drugs*sex*drugs + coef_pmle$sex_x_social_iso*sex*social_isolation +
+        coef_pmle$sex_x_fighting*sex*fighting + coef_pmle$sex_x_ran_away*sex*ran_away +
+        coef_pmle$sex_x_prob_malt*sex*maltreatment_prob + coef_pmle$sex_x_severe_malt*sex*maltreatment_severe +
+        coef_pmle$sex_x_mom_2*sex*mom_2 + coef_pmle$sex_x_mom_3*sex*mom_3 +
+        coef_pmle$sex_x_mom_4*sex*mom_4 + coef_pmle$sex_x_mom_5*sex*mom_5 +
+        coef_pmle$sex_x_dad_2*sex*dad_2 + coef_pmle$sex_x_dad_3*sex*dad_3 +
+        coef_pmle$sex_x_dad_4*sex*dad_4 + coef_pmle$sex_x_dad_5*sex*dad_5 +
+        coef_pmle$sex_x_btw_2*sex*btw_2 + coef_pmle$sex_x_btw_3*sex*btw_3 +
+        coef_pmle$sex_x_btw_4*sex*btw_4 + coef_pmle$sex_x_btw_5*sex*btw_5,
+      predicted_prob = 1 / (1 + exp(-lp))
+    )
+}
+
+pel_2004_model <- build_lp(pel_2004_valid)
+
+## ---- 12. Validation metrics and bootstrap -----------------------------------
+## compute_validation_metrics(): point estimates with analytic CIs for the
+## C-statistic (DeLong), calibration intercept and slope (Wald) and O/E ratio
+## (exact Poisson). All tables report bootstrap CIs (bootstrap_all_metrics), so
+## one method is used for every metric.
+
+compute_validation_metrics <- function(y, p, lp) {
+  ## Direction is fixed explicitly: with "auto", a resample in which the case
+  ## and control medians invert would silently flip the AUC above 0.5.
+  roc_obj <- pROC::roc(response = y, predictor = p, levels = c(0, 1), direction = "<", quiet = TRUE)
+  c_stat  <- as.numeric(pROC::auc(roc_obj))
+  c_ci    <- as.numeric(pROC::ci.auc(roc_obj, method = "delong"))
+
+  mean_p <- mean(p); mean_y <- mean(y)
+  mean_cal_error <- mean_p - mean_y
+
+  citl_model   <- glm(y ~ offset(lp), family = binomial)
+  citl_logodds <- unname(coef(citl_model)[1])
+
+  cal_model <- glm(y ~ lp, family = binomial)
+  cal_ci <- confint.default(cal_model)
+  cal_intercept <- unname(coef(cal_model)[1]); cal_slope <- unname(coef(cal_model)[2])
+
+  brier <- mean((y - p)^2)
+  loess_pred <- predict(loess(y ~ p, span = 0.75, degree = 1), p)
+  abs_cal_error <- abs(loess_pred - p)
+  ici  <- mean(abs_cal_error, na.rm = TRUE)
+  e50  <- median(abs_cal_error, na.rm = TRUE)
+  e90  <- as.numeric(quantile(abs_cal_error, 0.90, na.rm = TRUE))
+  emax <- max(abs_cal_error, na.rm = TRUE)
+
+  O <- as.integer(round(sum(y))); E <- sum(p)
+  oe_test <- poisson.test(x = O, T = E)
+
+  ## Full precision is returned; rounding happens only at display time (fmt_est,
+  ## fmt_ci_boot), so bootstrap quantiles are not taken over rounded values.
+  list(
+    metrics = tibble(
+      n = length(y), n_events = O, expected_events = E,
+      c_statistic = c_stat, c_lower = c_ci[1], c_upper = c_ci[3],
+      mean_cal_error = mean_cal_error,
+      citl_logodds = citl_logodds,
+      cal_intercept = cal_intercept, cal_intercept_lower = cal_ci[1,1], cal_intercept_upper = cal_ci[1,2],
+      cal_slope = cal_slope, cal_slope_lower = cal_ci[2,1], cal_slope_upper = cal_ci[2,2],
+      brier = brier,
+      ici = ici, e50 = e50, e90 = e90, emax = emax,
+      OE_ratio = O / E, OE_lower = oe_test$conf.int[1], OE_upper = oe_test$conf.int[2]
+    ),
+    roc = roc_obj
+  )
+}
+
+## Weighted empirical quantile (linear interpolation of the weighted CDF);
+## stats::quantile() has no weights argument.
+weighted_quantile <- function(x, w, probs) {
+  ord <- order(x)
+  x <- x[ord]; w <- w[ord]
+  cum_w <- cumsum(w) / sum(w)
+  as.numeric(approx(cum_w, x, xout = probs, rule = 2)$y)
+}
+
+## Weighted counterpart of compute_validation_metrics(), used for the IPW
+## sensitivity analysis. Each statistic is a closed-form weighted quantity (no
+## resampling), so it can be used for the point estimate and inside a bootstrap
+## replicate. pROC has no weighted AUC (WeightedROC is used instead);
+## quasibinomial is used for the calibration models to avoid warnings about
+## non-integer successes under continuous weights (point estimates are identical
+## to binomial).
+compute_weighted_validation_metrics <- function(y, p, lp, w) {
+  wroc   <- WeightedROC::WeightedROC(p, y, w)
+  c_stat <- WeightedROC::WeightedAUC(wroc)
+
+  mean_p <- weighted.mean(p, w); mean_y <- weighted.mean(y, w)
+  mean_cal_error <- mean_p - mean_y
+
+  citl_model_w <- glm(y ~ offset(lp), family = quasibinomial, weights = w)
+  citl_logodds <- unname(coef(citl_model_w)[1])
+
+  cal_model_w <- glm(y ~ lp, family = quasibinomial, weights = w)
+  cal_intercept <- unname(coef(cal_model_w)[1]); cal_slope <- unname(coef(cal_model_w)[2])
+
+  brier <- weighted.mean((y - p)^2, w)
+
+  loess_fit_w <- loess(y ~ p, weights = w, span = 0.75, degree = 1)
+  loess_pred_w <- predict(loess_fit_w, p)
+  abs_cal_error_w <- abs(loess_pred_w - p)
+  ici  <- weighted.mean(abs_cal_error_w, w, na.rm = TRUE)
+  e50  <- weighted_quantile(abs_cal_error_w, w, 0.50)
+  e90  <- weighted_quantile(abs_cal_error_w, w, 0.90)
+  emax <- max(abs_cal_error_w, na.rm = TRUE)
+
+  ## Weighted O/E ratio: weighted observed over weighted expected events.
+  O <- sum(w * y); E <- sum(w * p)
+
+  ## Full precision returned, as in compute_validation_metrics().
+  tibble(
+    n = length(y), n_events = sum(y), expected_events = E,
+    c_statistic = c_stat,
+    mean_cal_error = mean_cal_error,
+    citl_logodds = citl_logodds,
+    cal_intercept = cal_intercept,
+    cal_slope = cal_slope,
+    brier = brier,
+    ici = ici, e50 = e50, e90 = e90, emax = emax,
+    OE_ratio = O / E
+  )
+}
+
+## Metrics that are bootstrapped (point-estimate columns only, not the analytic
+## CI columns).
+BOOTSTRAP_METRIC_NAMES <- c("c_statistic", "mean_cal_error", "citl_logodds", "cal_intercept",
+                             "cal_slope", "OE_ratio", "brier", "ici", "e50", "e90", "emax")
+
+## Runs one bootstrap replicate: warnings are counted in warn_env$n (not
+## printed) and the replicate is dropped (NULL) on error. warning: false in the
+## YAML header hides warning text, so these counts keep the warning rate
+## visible.
+run_boot_replicate <- function(expr, warn_env) {
+  tryCatch(
+    withCallingHandlers(
+      expr,
+      warning = function(w) {
+        assign("n", warn_env$n + 1, envir = warn_env)
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) NULL
+  )
+}
+
+## Generic bootstrap engine. Resamples rows with replacement and recomputes
+## compute_validation_metrics() on each resample. The point estimate is the
+## metric on the original data; CIs are the 2.5th and 97.5th percentiles across
+## replicates.
+bootstrap_all_metrics <- function(data, prob_col, lp_col, outcome_col = "depression_outcome",
+                                    n_boot = N_BOOT, seed = 2024) {
+  set.seed(seed)
+  n <- nrow(data)
+  probs <- rep(1 / n, n)
+
+  ## Degenerate resamples (e.g. a loess fit that does not converge) are dropped
+  ## rather than aborting the run; failures are counted and reported.
+  boot_list <- vector("list", n_boot)
+  warn_env <- new.env(); warn_env$n <- 0
+  for (b in seq_len(n_boot)) {
+    idx <- sample.int(n, size = n, replace = TRUE, prob = probs)
+    rs  <- data[idx, ]
+    boot_list[[b]] <- run_boot_replicate(
+      compute_validation_metrics(rs[[outcome_col]], rs[[prob_col]], rs[[lp_col]])$metrics,
+      warn_env
+    )
+  }
+  n_failed <- sum(vapply(boot_list, is.null, logical(1)))
+  if (n_failed > 0) cat(sprintf("  (bootstrap: %d/%d replicates failed and were dropped)\n", n_failed, n_boot))
+  if (warn_env$n > 0) cat(sprintf("  (bootstrap: %d warnings raised across %d replicates)\n", warn_env$n, n_boot))
+  boot_df <- bind_rows(boot_list)
+
+  point <- compute_validation_metrics(data[[outcome_col]], data[[prob_col]], data[[lp_col]])$metrics
+
+  out <- point
+  for (m in BOOTSTRAP_METRIC_NAMES) {
+    out[[paste0(m, "_lo")]] <- round(as.numeric(quantile(boot_df[[m]], 0.025, na.rm = TRUE)), 4)
+    out[[paste0(m, "_hi")]] <- round(as.numeric(quantile(boot_df[[m]], 0.975, na.rm = TRUE)), 4)
+  }
+  out
+}
+
+## Two-column (original vs. recalibrated) table formatter with bootstrap CIs;
+## used for Table 2 and each sensitivity analysis.
+fmt_est <- function(x, digits = 2) sprintf(paste0("%.", digits, "f"), round(x, digits))
+fmt_ci_boot <- function(est, lo, hi, digits = 2) {
+  sprintf(paste0("%.", digits, "f (%.", digits, "f to %.", digits, "f)"),
+          round(est, digits), round(lo, digits), round(hi, digits))
+}
+
+build_table2_style <- function(boot_std, boot_recal) {
+  tibble(
+    `Performance parameter` = c(
+      "C-statistic (95% CI)",
+      "Mean calibration error (predicted - observed)",
+      "Calibration-in-the-large (log-odds scale)",
+      "Calibration intercept (95% CI)",
+      "Calibration slope (95% CI)",
+      "O/E ratio (95% CI)",
+      "Brier score",
+      "ICI / E-avg (mean absolute calibration error)",
+      "E50 (median absolute calibration error)",
+      "E90 (90th percentile absolute calibration error)",
+      "Emax (max. absolute calibration error)"
+    ),
+    `Original model` = c(
+      fmt_ci_boot(boot_std$c_statistic, boot_std$c_statistic_lo, boot_std$c_statistic_hi),
+      fmt_ci_boot(boot_std$mean_cal_error, boot_std$mean_cal_error_lo, boot_std$mean_cal_error_hi, 3),
+      fmt_ci_boot(boot_std$citl_logodds, boot_std$citl_logodds_lo, boot_std$citl_logodds_hi),
+      fmt_ci_boot(boot_std$cal_intercept, boot_std$cal_intercept_lo, boot_std$cal_intercept_hi),
+      fmt_ci_boot(boot_std$cal_slope, boot_std$cal_slope_lo, boot_std$cal_slope_hi),
+      fmt_ci_boot(boot_std$OE_ratio, boot_std$OE_ratio_lo, boot_std$OE_ratio_hi),
+      fmt_ci_boot(boot_std$brier, boot_std$brier_lo, boot_std$brier_hi, 3),
+      fmt_ci_boot(boot_std$ici, boot_std$ici_lo, boot_std$ici_hi),
+      fmt_ci_boot(boot_std$e50, boot_std$e50_lo, boot_std$e50_hi),
+      fmt_ci_boot(boot_std$e90, boot_std$e90_lo, boot_std$e90_hi),
+      fmt_ci_boot(boot_std$emax, boot_std$emax_lo, boot_std$emax_hi)
+    ),
+    `Recalibrated model` = c(
+      fmt_ci_boot(boot_recal$c_statistic, boot_recal$c_statistic_lo, boot_recal$c_statistic_hi),
+      fmt_ci_boot(boot_recal$mean_cal_error, boot_recal$mean_cal_error_lo, boot_recal$mean_cal_error_hi, 3),
+      fmt_ci_boot(boot_recal$citl_logodds, boot_recal$citl_logodds_lo, boot_recal$citl_logodds_hi),
+      fmt_ci_boot(boot_recal$cal_intercept, boot_recal$cal_intercept_lo, boot_recal$cal_intercept_hi),
+      fmt_ci_boot(boot_recal$cal_slope, boot_recal$cal_slope_lo, boot_recal$cal_slope_hi),
+      fmt_ci_boot(boot_recal$OE_ratio, boot_recal$OE_ratio_lo, boot_recal$OE_ratio_hi),
+      fmt_ci_boot(boot_recal$brier, boot_recal$brier_lo, boot_recal$brier_hi, 3),
+      fmt_ci_boot(boot_recal$ici, boot_recal$ici_lo, boot_recal$ici_hi),
+      fmt_ci_boot(boot_recal$e50, boot_recal$e50_lo, boot_recal$e50_hi),
+      fmt_ci_boot(boot_recal$e90, boot_recal$e90_lo, boot_recal$e90_hi),
+      fmt_ci_boot(boot_recal$emax, boot_recal$emax_lo, boot_recal$emax_hi)
+    )
+  )
+}
+
+## Prevalence-gap decomposition: the rise from the 1993 prevalence (3.1%) to the
+## observed prevalence, split into the part explained by case-mix (mean
+## predicted risk) and an unexplained residual. Optional weights are used for
+## the IPW sensitivity analysis.
+decompose_prevalence_gap <- function(outcome, predicted_prob, weights = NULL, dev_prevalence = 3.1) {
+  if (is.null(weights)) {
+    obs_prev  <- 100 * mean(outcome)
+    mean_pred <- 100 * mean(predicted_prob)
+  } else {
+    obs_prev  <- 100 * weighted.mean(outcome, weights)
+    mean_pred <- 100 * weighted.mean(predicted_prob, weights)
+  }
+  tibble(
+    Observed_prevalence_pct   = round(obs_prev, 1),
+    Mean_predicted_risk_pct   = round(mean_pred, 2),
+    Dev_cohort_prevalence_pct = dev_prevalence,
+    Total_gap_pct             = round(obs_prev - dev_prevalence, 1),
+    Casemix_explained_pct     = round(mean_pred - dev_prevalence, 1),
+    Residual_pct              = round(obs_prev - mean_pred, 1)
+  )
+}
+
+## Calibration plot (loess curve and decile points with Wilson intervals),
+## unweighted or weighted; used for Figure 3 and the sensitivity plots.
+build_calibration_plot <- function(data, prob_col, outcome_col, weight_col = NULL, title) {
+  if (is.null(weight_col)) {
+    loess_fit <- loess(as.formula(paste(outcome_col, "~", prob_col)), data = data, span = 0.75, degree = 1)
+  } else {
+    loess_fit <- loess(as.formula(paste(outcome_col, "~", prob_col)), data = data, span = 0.75, degree = 1,
+                        weights = data[[weight_col]])
+  }
+
+  trim_range <- quantile(data[[prob_col]], c(0.01, 0.99))
+  pred_range <- seq(trim_range[1], trim_range[2], length.out = 200)
+  loess_pred <- predict(loess_fit, newdata = setNames(data.frame(pred_range), prob_col), se = TRUE)
+
+  loess_df <- tibble(
+    x = pred_range, fit = loess_pred$fit,
+    lower = loess_pred$fit - 1.96 * loess_pred$se.fit,
+    upper = loess_pred$fit + 1.96 * loess_pred$se.fit
+  )
+
+  data <- data %>% mutate(.decile = ntile(.data[[prob_col]], 10))
+
+  if (is.null(weight_col)) {
+    binned <- data %>% group_by(.decile) %>%
+      summarise(mean_predicted = mean(.data[[prob_col]]), mean_observed = mean(.data[[outcome_col]]), n = n(), .groups = "drop")
+  } else {
+    binned <- data %>% group_by(.decile) %>%
+      summarise(mean_predicted = weighted.mean(.data[[prob_col]], .data[[weight_col]]),
+                mean_observed  = weighted.mean(.data[[outcome_col]], .data[[weight_col]]),
+                n = n(), .groups = "drop")
+  }
+
+  ## Wilson score intervals: several deciles have low event proportions, where
+  ## Wald intervals can extend below 0.
+  z <- 1.96
+  binned <- binned %>%
+    mutate(
+      wilson_center    = (mean_observed + z^2 / (2 * n)) / (1 + z^2 / n),
+      wilson_halfwidth = z * sqrt(mean_observed * (1 - mean_observed) / n + z^2 / (4 * n^2)) / (1 + z^2 / n),
+      ci_lower = pmax(wilson_center - wilson_halfwidth, 0),
+      ci_upper = pmin(wilson_center + wilson_halfwidth, 1)
+    )
+
+  ggplot() +
+    geom_ribbon(data = loess_df, aes(x = x, ymin = pmax(lower, 0), ymax = pmin(upper, 1)),
+                fill = PLOT_BLUE, alpha = 0.15) +
+    geom_line(data = loess_df, aes(x = x, y = fit), color = PLOT_BLUE, linewidth = 0.8) +
+    geom_point(data = binned, aes(mean_predicted, mean_observed), size = 3) +
+    geom_errorbar(data = binned,
+                   aes(x = mean_predicted, ymin = ci_lower, ymax = ci_upper),
+                   width = 0.01) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
+    coord_equal(xlim = c(0, 0.5), ylim = c(0, 0.5)) +
+    labs(title = title, x = "Predicted probability", y = "Observed frequency") +
+    theme_bw()
+}
+
+## ---- 13. Main analysis: standard + recalibrated validation (Table 2) --------
+
+result_standard   <- compute_validation_metrics(pel_2004_model$depression_outcome, pel_2004_model$predicted_prob, pel_2004_model$lp)
+metrics_standard  <- result_standard$metrics
+roc_standard       <- result_standard$roc
+
+## The recalibrated intercept is estimated once on the full sample and then held
+## fixed, so bootstrap CIs for the recalibrated metrics reflect sampling
+## variability conditional on that intercept.
+recal_model   <- glm(depression_outcome ~ offset(lp), data = pel_2004_model, family = binomial)
+new_intercept <- coef(recal_model)[1]
+cat(sprintf("\nRecalibrated intercept: %.3f (original: %.3f)\n", new_intercept, coef_pmle$intercept))
+
+pel_2004_model <- pel_2004_model %>%
+  mutate(lp_recal = lp + new_intercept, predicted_prob_recal = 1 / (1 + exp(-lp_recal)))
+
+result_recal   <- compute_validation_metrics(pel_2004_model$depression_outcome, pel_2004_model$predicted_prob_recal, pel_2004_model$lp_recal)
+metrics_recal  <- result_recal$metrics
+
+cat("\n--- Original model ---\n"); print(metrics_standard)
+cat("\n--- Recalibrated model ---\n"); print(metrics_recal)
+
+boot_main_std   <- bootstrap_all_metrics(pel_2004_model, "predicted_prob",       "lp",        n_boot = N_BOOT)
+boot_main_recal <- bootstrap_all_metrics(pel_2004_model, "predicted_prob_recal", "lp_recal",  n_boot = N_BOOT)
+
+table2_manuscript <- build_table2_style(boot_main_std, boot_main_recal)
+cat("\n--- Table 2 (bootstrap 95% CIs) ---\n"); print(table2_manuscript, width = Inf)
+
+## ---- 14. Mean predicted risk distribution + prevalence-gap decomposition ----
+
+predicted_risk_distribution <- tibble(
+  Statistic = c("Mean predicted risk (standard model)", "Median", "Q1 (25th pct)", "Q3 (75th pct)", "Min", "Max"),
+  Value_pct = round(100 * c(
+    mean(pel_2004_model$predicted_prob), median(pel_2004_model$predicted_prob),
+    quantile(pel_2004_model$predicted_prob, 0.25), quantile(pel_2004_model$predicted_prob, 0.75),
+    min(pel_2004_model$predicted_prob), max(pel_2004_model$predicted_prob)
+  ), 2)
+)
+cat("\n--- Predicted risk distribution, standard model (main analysis) ---\n")
+print(predicted_risk_distribution)
+
+gap_main <- decompose_prevalence_gap(pel_2004_model$depression_outcome, pel_2004_model$predicted_prob) %>%
+  mutate(Scenario = "Main analysis", .before = 1)
+cat(sprintf(
+  "\nMain analysis: observed prevalence = %.1f%%; mean predicted risk = %.2f%%; 1993 prevalence = 3.1%%.\nCase-mix explains ~%.1f points of the %.1f-point rise; residual ~%.1f points not captured by the predictors.\n",
+  gap_main$Observed_prevalence_pct, gap_main$Mean_predicted_risk_pct,
+  gap_main$Casemix_explained_pct, gap_main$Total_gap_pct, gap_main$Residual_pct
+))
+
+## ---- 15. Figure 2 (ROC) and Figure 3 (calibration) --------------------------
+## One ROC curve is shown: recalibrating the intercept does not change the
+## ranking of predicted risks, so the ROC curve and C-statistic are identical
+## for the original and recalibrated models.
+
+get_threshold_points <- function(roc_obj, thresholds, labels) {
+  coords_df <- pROC::coords(roc_obj, x = thresholds, input = "threshold",
+                             ret = c("threshold", "sensitivity", "specificity"))
+  coords_df %>% mutate(label = labels)
+}
+
+## Threshold markers are recalibrated risk cut-offs (5%, 10%, 20%) mapped back
+## to the original-model probability scale via the recalibration intercept, so
+## that they sit correctly on the single ROC curve.
+recal_threshold_pct <- c(0.05, 0.10, 0.20)
+standard_scale_thresholds <- plogis(qlogis(recal_threshold_pct) - new_intercept)
+thresh_std <- get_threshold_points(roc_standard, standard_scale_thresholds,
+                                     labels = sprintf("%.1f%%", recal_threshold_pct * 100))
+print(thresh_std)
+
+set.seed(2024)
+ci_se_obj <- pROC::ci.se(roc_standard, specificities = seq(0, 1, 0.01), boot.n = 2000, progress = "none")
+ci_se_df <- as.data.frame(unclass(ci_se_obj)) %>%
+  tibble::rownames_to_column("specificity") %>%
+  mutate(specificity = as.numeric(specificity)) %>%
+  rename(sens_lower = `2.5%`, sens_median = `50%`, sens_upper = `97.5%`)
+
+## Ties in specificity are sorted by sensitivity so that vertical steps are
+## drawn in the correct direction.
+roc_line_df <- tibble(specificity = roc_standard$specificities, sensitivity = roc_standard$sensitivities) %>%
+  arrange(desc(specificity), sensitivity)
+
+roc_plot <- ggplot() +
+  geom_ribbon(data = ci_se_df, aes(x = specificity, ymin = sens_lower, ymax = sens_upper),
+              fill = PLOT_BLUE, alpha = 0.2) +
+  geom_path(data = roc_line_df, aes(x = specificity, y = sensitivity), color = PLOT_BLUE, linewidth = 0.8) +
+  geom_abline(intercept = 1, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(data = thresh_std, aes(x = specificity, y = sensitivity), color = "black", size = 2) +
+  geom_text(data = thresh_std, aes(x = specificity, y = sensitivity, label = label), hjust = -0.15, size = 3) +
+  scale_x_reverse(limits = c(1, 0)) +
+  coord_equal() +
+  labs(x = "Specificity", y = "Sensitivity") +
+  theme_bw()
+
+ggsave("results/figure_2_roc_curve.png", roc_plot, width = 6, height = 5, dpi = 300)
+
+cal_standard_plot <- build_calibration_plot(pel_2004_model, "predicted_prob", "depression_outcome", title = "Original model")
+cal_recal_plot    <- build_calibration_plot(pel_2004_model, "predicted_prob_recal", "depression_outcome", title = "Recalibrated model")
+combined_cal_plot <- cal_standard_plot + cal_recal_plot
+
+ggsave("results/figure_3_calibration_original.png", cal_standard_plot, width = 6, height = 5, dpi = 300)
+ggsave("results/figure_3_calibration_recalibrated.png", cal_recal_plot, width = 6, height = 5, dpi = 300)
+ggsave("results/figure_3_calibration_combined.png", combined_cal_plot, width = 12, height = 5, dpi = 300)
+
+## ---- 16. Flow diagram ---------------------------------------------------------
+
+build_flow_diagram <- function(flow_tbl, box_width = 1.05, box_height = 0.6, vgap = 1.05) {
+  flow_tbl <- head(flow_tbl, -1)
+  n_steps <- nrow(flow_tbl)
+  flow_tbl$Step[n_steps] <- paste0(flow_tbl$Step[n_steps], "  ->  Final validation sample")
+
+  seq_steps <- tibble(
+    label = paste0(flow_tbl$Step, "\nN = ", format(flow_tbl$n_remaining, big.mark = ",")),
+    y = rev(seq_len(n_steps)) * vgap
+  )
+  seq_excl <- tibble(
+    y    = seq_steps$y[-n_steps] - box_height / 2,
+    yend = seq_steps$y[-1] + box_height / 2,
+    label = paste0("-", format(flow_tbl$n_excluded_this_step[-1], big.mark = ","))
+  )
+
+  ggplot() +
+    geom_rect(data = seq_steps,
+              aes(xmin = -box_width, xmax = box_width, ymin = y - box_height / 2, ymax = y + box_height / 2),
+              fill = "white", color = "black", linewidth = 0.4) +
+    geom_text(data = seq_steps, aes(x = 0, y = y, label = label), size = 3.0, lineheight = 0.9) +
+    geom_segment(data = seq_excl, aes(x = 0, xend = 0, y = y, yend = yend),
+                 arrow = arrow(length = unit(0.15, "cm"), type = "closed"), linewidth = 0.4) +
+    geom_text(data = seq_excl, aes(x = box_width + 0.15, y = (y + yend) / 2, label = label),
+              size = 2.7, hjust = 0, color = "gray30") +
+    xlim(-box_width - 0.3, box_width + 1.8) +
+    theme_void() +
+    theme(plot.margin = margin(10, 90, 10, 10))
+}
+
+## build_flow_diagram() drops the last row of flow_table (mania data
+## availability) and labels the row above as the final sample. This is valid
+## only if nobody is excluded at that step, which is asserted here.
+stopifnot(n_18y_outcome_available == n_final)
+flow_diagram_plot <- build_flow_diagram(flow_table)
+ggsave("results/figure_s1_flow_diagram.png", flow_diagram_plot, width = 9, height = 8.5, dpi = 300, bg = "white")
+
+## ---- 17. Sensitivity: recoding of "no parental figure present" (Table S8) ----
+## Every substantive category (great, very good, good, regular, bad [= main
+## analysis]) and exclusion of these adolescents. This is separate from
+## Sensitivities 1-4 below. Original (non-recalibrated) model only:
+## recalibrating within each scenario would re-equalise mean predicted and
+## observed risk and mask sensitivity to the coding choice.
+
+apply_recode_scenario <- function(base_data, scenario = c("bad", "great", "very_good", "good", "regular", "exclude")) {
+  scenario <- match.arg(scenario)
+  if (scenario == "exclude") {
+    return(base_data %>% filter(!(father_recoded_to_ref | mother_recoded_to_ref | between_recoded_to_ref)))
+  }
+  target_cat <- switch(scenario, great = 1, very_good = 2, good = 3, regular = 4, bad = 5)
+  base_data %>%
+    mutate(
+      rel_mother_cat  = ifelse(mother_recoded_to_ref,  target_cat, rel_mother_cat),
+      rel_father_cat  = ifelse(father_recoded_to_ref,  target_cat, rel_father_cat),
+      rel_between_cat = ifelse(between_recoded_to_ref, target_cat, rel_between_cat)
+    )
+}
+
+scenario_labels <- c(
+  bad       = "Main analysis: recoded to \"bad\"",
+  great     = "Sensitivity 1: recoded to \"great\"",
+  very_good = "Sensitivity 2: recoded to \"very good\"",
+  good      = "Sensitivity 3: recoded to \"good\"",
+  regular   = "Sensitivity 4: recoded to \"regular\"",
+  exclude   = "Sensitivity 5: excluded entirely"
+)
+
+pel_2004_valid_raw_rel <- pel_2004_valid %>%
+  mutate(rel_mother_cat = rel_mother_raw, rel_father_cat = rel_father_raw, rel_between_cat = rel_between_raw)
+
+## Bootstrap 95% CIs for every metric (unweighted).
+sensitivity_results <- list()
+for (scen in names(scenario_labels)) {
+  scen_data  <- apply_recode_scenario(pel_2004_valid_raw_rel, scen)
+  scen_model <- build_lp(scen_data)
+  scen_metrics <- bootstrap_all_metrics(scen_model, "predicted_prob", "lp", n_boot = N_BOOT)
+  sensitivity_results[[scen]] <- scen_metrics %>% mutate(Scenario = scenario_labels[scen], .before = 1)
+}
+
+sensitivity_table <- bind_rows(sensitivity_results) %>%
+  transmute(
+    Scenario, N = n, Events = sprintf("%d (%.1f%%)", n_events, 100 * n_events / N),
+    `C-statistic (95% CI)` = fmt_ci_boot(c_statistic, c_statistic_lo, c_statistic_hi),
+    `Calibration slope (95% CI)` = fmt_ci_boot(cal_slope, cal_slope_lo, cal_slope_hi),
+    `Calibration-in-the-large (95% CI)` = fmt_ci_boot(citl_logodds, citl_logodds_lo, citl_logodds_hi),
+    `O/E ratio (95% CI)` = fmt_ci_boot(OE_ratio, OE_ratio_lo, OE_ratio_hi),
+    `Brier score (95% CI)` = fmt_ci_boot(brier, brier_lo, brier_hi, 3)
+  )
+cat("\n--- Table S8 (parent-figure-recoding sensitivity) ---\n"); print(sensitivity_table, width = Inf)
+
+## ---- 18. Linear predictor spread: 2004 vs. 1993 -----------------------------
+
+lp_mean <- mean(pel_2004_model$lp, na.rm = TRUE)
+lp_sd   <- sd(pel_2004_model$lp, na.rm = TRUE)
+lp_median <- median(pel_2004_model$lp, na.rm = TRUE)
+lp_q1 <- as.numeric(quantile(pel_2004_model$lp, 0.25, na.rm = TRUE))
+lp_q3 <- as.numeric(quantile(pel_2004_model$lp, 0.75, na.rm = TRUE))
+
+linear_predictor_comparison <- tibble(
+  Cohort    = c("Pelotas 1993 (development, internal validation)", "Pelotas 2004 (this validation)"),
+  Mean_lp   = c(-3.678, round(lp_mean, 3)),
+  SD_lp     = c(0.685, round(lp_sd, 3)),
+  Median_lp = c(NA_real_, round(lp_median, 3)),
+  Q1_lp     = c(NA_real_, round(lp_q1, 3)),
+  Q3_lp     = c(NA_real_, round(lp_q3, 3)),
+  Source    = c("Rocha et al. (2021), Supplement 2", "This analysis")
+)
+cat("\n--- Linear predictor spread: 2004 vs. 1993 ---\n"); print(linear_predictor_comparison)
+
+## ---- 19. Screening diagnostics for Sensitivities 2-4 (IQ, SDQ, DAWBA-11) ----
+
+## fqiwiscstd is a Z-score in this sample (mean ~0, SD 1), not a deviation IQ
+## (mean 100, SD 15), so IQ < 70 corresponds to Z < (70 - 100) / 15 = -2.0.
+## Participants with missing IQ (mostly non-participation at the age-6 wave) are
+## excluded, mirroring the 1993 requirement for a valid IQ measurement.
+IQ_Z_CUTOFF <- -2.0
+status_data <- status_data %>%
+  mutate(iq6_missing = is.na(fqiwiscstd), iq6_excludes = iq6_missing | (fqiwiscstd < IQ_Z_CUTOFF))
+
+## Standard five-item SDQ emotional-symptoms subscale (0/1/2 each). The cut-off
+## of 4 follows Goodman's parent-report "borderline or abnormal" band (0-3 close
+## to average, 4 borderline, 5-10 abnormal). Rocha et al. (2021) describe the
+## 1993 rule only as a "borderline score" without a numeric cut-off, and SDQ
+## norms in Brazilian samples differ from the UK bands; the cut-off flags more
+## adolescents than expected under UK norms (see screening_diagnostics).
+## Sensitivity 4 is therefore exploratory.
+SDQ_BORDERLINE_CUTOFF <- 4
+status_data <- status_data %>%
+  mutate(
+    sdq_emo_11_sum = p1somatic_11 + p1worries_11 + p1unhappy_11 + p1clingy_11 + p1afraid_11,
+    sdq_emo_15_sum = p1somatic_15 + p1worries_15 + p1unhappy_15 + p1clingy_15 + p1afraid_15,
+    sdq_emo_11_borderline = sdq_emo_11_sum >= SDQ_BORDERLINE_CUTOFF,
+    sdq_emo_15_borderline = sdq_emo_15_sum >= SDQ_BORDERLINE_CUTOFF,
+    ## Sensitivity 4: SDQ only (no DAWBA).
+    baseline_depression_sdq_only = ifelse(
+      !missing_15y_data,
+      as.integer((sdq_emo_11_borderline %in% TRUE) | (sdq_emo_15_borderline %in% TRUE)),
+      NA_integer_
+    )
+  )
+
+## Same rule as the age-15 DAWBA fields (!= 0 is positive), applied to the
+## age-11 fields. DAWBA-11 positivity is low, so it is a narrower,
+## higher-specificity screen than the SDQ subscale.
+status_data <- status_data %>%
+  mutate(
+    dawba15_positive = dcmadep != 0 | dcotdep != 0 | dcundif != 0 | icmadep != 0 | icotdep != 0 | icundif != 0,
+    dawba11_positive = gdcmadep != 0 | gdcotdep != 0 | gdcundif != 0 | gicmadep != 0 | gicotdep != 0 | gicundif != 0,
+    ## Sensitivity 3: DAWBA-15 or DAWBA-11 only (no SDQ).
+    baseline_depression_dawba_only = ifelse(
+      !missing_15y_data,
+      as.integer((dawba15_positive %in% TRUE) | (dawba11_positive %in% TRUE)),
+      NA_integer_
+    )
+  )
+
+screening_diagnostics <- tibble(
+  Metric = c("Missing IQ (age 6) data, full cohort",
+             "IQ Z-score < -2.0 (IQ<70-equivalent), among those with IQ data",
+             "SDQ emotional subscale >= cutoff at age 11, among those with 11y SDQ data",
+             "SDQ emotional subscale >= cutoff at age 15, among those with 15y SDQ data",
+             "DAWBA-11 positive (any of 6 fields), among those with 11y DAWBA data",
+             "DAWBA-15 positive (any of 6 fields), among those with 15y DAWBA data"),
+  n = c(sum(status_data$iq6_missing),
+        sum(!status_data$iq6_missing & status_data$fqiwiscstd < IQ_Z_CUTOFF),
+        sum(status_data$sdq_emo_11_borderline, na.rm = TRUE),
+        sum(status_data$sdq_emo_15_borderline, na.rm = TRUE),
+        sum(status_data$dawba11_positive, na.rm = TRUE),
+        sum(status_data$dawba15_positive, na.rm = TRUE)),
+  N_denominator = c(nrow(status_data), sum(!status_data$iq6_missing),
+                     sum(!is.na(status_data$sdq_emo_11_sum)), sum(!is.na(status_data$sdq_emo_15_sum)),
+                     sum(!is.na(status_data$gdcmadep)), sum(!is.na(status_data$dcmadep)))
+) %>%
+  mutate(Pct = round(100 * n / N_denominator, 1))
+cat("\n--- Screening diagnostics (IQ, SDQ, DAWBA-11) ---\n"); print(screening_diagnostics, n = Inf)
+
+## baseline_depression_sdq_only and baseline_depression_dawba_only treat a
+## missing screen as screen-negative (%in% TRUE reads NA as FALSE) among
+## participants with complete age-15 data. The extent is reported below.
+missing_screen_as_negative <- tibble(
+  Screen = c("SDQ emotional subscale, age 11", "SDQ emotional subscale, age 15", "DAWBA-11 (6 fields)"),
+  N_missing_among_15y_complete = c(
+    sum(!status_data$missing_15y_data & is.na(status_data$sdq_emo_11_sum)),
+    sum(!status_data$missing_15y_data & is.na(status_data$sdq_emo_15_sum)),
+    sum(!status_data$missing_15y_data & is.na(status_data$gdcmadep))
+  ),
+  N_15y_complete = sum(!status_data$missing_15y_data)
+) %>%
+  mutate(Pct = round(100 * N_missing_among_15y_complete / N_15y_complete, 1))
+cat("\n--- Missing alternative baseline-depression screen, defaulted to screen-negative (Sensitivities 3/4) ---\n")
+print(missing_screen_as_negative)
+
+## ---- Sensitivity-sample builder -------------------------------------------
+## Adds the IQ and/or alternative depression-screen criteria on top of all other
+## main-analysis exclusions.
+
+build_sensitivity_sample <- function(depression_col, apply_iq) {
+  d <- status_data %>%
+    mutate(
+      baseline_depression_this = .data[[depression_col]],
+      iq_ex_this = if (apply_iq) iq6_excludes else FALSE,
+      eligibility_status_this = case_when(
+        missing_15y_data                      ~ "Excluded: missing 15y predictor/baseline-diagnosis data",
+        !(puberty_data_present %in% TRUE)     ~ "Excluded: missing puberty data",
+        is.na(puberty_started)                ~ "Excluded: ambiguous puberty status",
+        !(puberty_started %in% TRUE)          ~ "Excluded: pre-pubertal at 15y",
+        iq_ex_this %in% TRUE                  ~ "Excluded: IQ<70-equivalent or missing IQ at 6y",
+        baseline_depression_this == 1         ~ "Excluded: baseline depression (extended or standard screen)",
+        missing_18y_outcome                   ~ "Excluded: missing 18y depression outcome",
+        !(mania_data_present %in% TRUE)       ~ "Excluded: missing mania/hypomania screening data",
+        TRUE                                    ~ "Included: valid case"
+      )
+    )
+  final <- d %>% filter(eligibility_status_this == "Included: valid case")
+  list(final_ids = final$idalt20241223, n_final = nrow(final))
+}
+
+## Built with build_analytic_dataset() rather than by filtering pel_2004_valid:
+## the DAWBA-only and SDQ-only screens are not nested within the main screen, so
+## a participant excluded from the main sample can qualify for a sensitivity
+## sample, and vice versa.
+build_sensitivity_model <- function(sens_ids) {
+  built <- build_analytic_dataset(sens_ids) %>% filter(!is.na(depression_outcome))
+  stopifnot(nrow(built) == length(sens_ids))
+  built %>% build_lp()
+}
+
+## Full report for one sensitivity analysis: recalibration, bootstrap CIs
+## (original and recalibrated), Table 2-style table, prevalence-gap
+## decomposition and calibration plots.
+report_sensitivity <- function(sens_label, model_data, n_boot = N_BOOT) {
+  recal_model_s <- glm(depression_outcome ~ offset(lp), data = model_data, family = binomial)
+  new_intercept_s <- unname(coef(recal_model_s)[1])
+  model_data <- model_data %>%
+    mutate(lp_recal = lp + new_intercept_s, predicted_prob_recal = 1 / (1 + exp(-lp_recal)))
+
+  boot_std   <- bootstrap_all_metrics(model_data, "predicted_prob", "lp", n_boot = n_boot)
+  boot_recal <- bootstrap_all_metrics(model_data, "predicted_prob_recal", "lp_recal", n_boot = n_boot)
+
+  perf_table <- build_table2_style(boot_std, boot_recal)
+
+  gap <- decompose_prevalence_gap(model_data$depression_outcome, model_data$predicted_prob) %>%
+    mutate(Scenario = sens_label, .before = 1)
+
+  cal_std   <- build_calibration_plot(model_data, "predicted_prob",       "depression_outcome", title = paste0(sens_label, " - Original model"))
+  cal_recal <- build_calibration_plot(model_data, "predicted_prob_recal", "depression_outcome", title = paste0(sens_label, " - Recalibrated model"))
+
+  cat(sprintf("\n--- %s ---\n", sens_label))
+  cat(sprintf("N = %d | Observed prevalence = %.1f%% | Mean predicted risk = %.2f%% | Case-mix explains ~%.1f of the %.1f-point rise vs. 1993; residual ~%.1f points\n",
+              nrow(model_data), gap$Observed_prevalence_pct, gap$Mean_predicted_risk_pct,
+              gap$Casemix_explained_pct, gap$Total_gap_pct, gap$Residual_pct))
+  print(perf_table, width = Inf)
+
+  list(table = perf_table, gap = gap, boot_std = boot_std, boot_recal = boot_recal,
+       cal_std = cal_std, cal_recal = cal_recal, new_intercept = new_intercept_s, model_data = model_data)
+}
+
+## ---- 20. Sensitivity 1: IPW re-weighting ------------------------------------
+## Reweights the final sample and excludes nobody. Stage 1 models completion of
+## the age-15 assessment (sex, skin colour, maternal education, household
+## income); Stage 2 models availability of the age-18 outcome (the 11 IDEA-RS
+## predictors).
+
+status_data <- status_data %>%
+  mutate(
+    ## Observed and eligible at age 15. Used only for the descriptive comparison
+    ## in Table S5, not as the Stage 1 outcome (see stage1_fit_data).
+    reached_15y_eligible = as.integer(!missing_15y_data & baseline_depression == 0 & puberty_started %in% TRUE),
+    aescmae4cat_imp = ifelse(is.na(aescmae4cat), 9, aescmae4cat)  ## 9 = "Missing" category
+  )
+
+## Stage 1 models attrition only: whether the age-15 assessment was completed
+## with usable predictor and puberty data. Participants excluded by design
+## (pre-pubertal, baseline depression) were observed at age 15, so coding them
+## as failures would conflate an eligibility criterion with loss to follow-up;
+## they are dropped from this fitting sample.
+stage1_fit_data <- status_data %>%
+  filter(eligibility_group != "Excluded (by design / eligibility criterion)") %>%
+  mutate(observed_15y_eligible = as.integer(!missing_15y_data & (puberty_data_present %in% TRUE) & !is.na(puberty_started)))
+
+## P(age-15 assessment completed with usable data | sex, skin colour, maternal
+## education, household income). Missing maternal education is its own factor
+## level, so every participant receives a Stage 1 probability. Household income
+## (arendsm) enters continuous and untransformed, as a balancing covariate
+## rather than an effect estimate. Sex is retained for consistency with Stage 2.
+stage1_model <- glm(observed_15y_eligible ~ factor(asexo) + factor(acorpele) + factor(aescmae4cat_imp) + arendsm,
+                     data = stage1_fit_data, family = binomial)
+cat("\n--- IPW Stage 1 model: P(15y assessment completed with usable data | sex, skin colour, maternal education, household income) ---\n")
+print(summary(stage1_model)$coefficients)
+
+status_data <- status_data %>% mutate(stage1_prob = predict(stage1_model, newdata = ., type = "response"))
+marginal_stage1 <- mean(stage1_fit_data$observed_15y_eligible)
+
+## Stage 2: P(age-18 outcome observed | the 11 IDEA-RS predictors), fitted in
+## the age-15-eligible sample. The full predictor set is used, rather than only
+## predictors significantly associated with loss to follow-up, to avoid
+## selecting covariates on the association the weights are meant to correct for.
+eligible_15y_data <- eligible_15y_data %>% mutate(has_18y_outcome = as.integer(!missing_18y_outcome))
+stage2_model <- glm(
+  has_18y_outcome ~ factor(asexo) + factor(acorpele) + school_pos + drugs_pos + isolation_pos +
+    fighting_pos + ranaway_pos + factor(maltreat_cat) + factor(rel_mother_cat) +
+    factor(rel_father_cat) + factor(rel_between_cat),
+  data = eligible_15y_data, family = binomial
+)
+cat("\n--- IPW Stage 2 model: P(18y outcome observed | 11 IDEA-RS predictors) ---\n")
+print(summary(stage2_model)$coefficients)
+
+eligible_15y_data <- eligible_15y_data %>% mutate(stage2_prob = predict(stage2_model, newdata = ., type = "response"))
+marginal_stage2 <- mean(eligible_15y_data$has_18y_outcome)
+
+attrition_weights <- status_data %>%
+  transmute(subject_id = idalt20241223, stage1_prob) %>%
+  inner_join(eligible_15y_data %>% transmute(subject_id = idalt20241223, stage2_prob),
+             by = "subject_id", relationship = "one-to-one") %>%
+  mutate(
+    raw_ipw        = 1 / (stage1_prob * stage2_prob),
+    stabilized_ipw = (marginal_stage1 / stage1_prob) * (marginal_stage2 / stage2_prob)
+  )
+stopifnot(nrow(attrition_weights) == n_15y_eligible)
+
+summ_stats <- function(x) c(Min = min(x), Q1 = as.numeric(quantile(x, .25)), Median = median(x),
+                             Mean = mean(x), Q3 = as.numeric(quantile(x, .75)), Max = max(x))
+weight_diagnostics <- tibble(
+  Statistic      = c("Min", "Q1", "Median", "Mean", "Q3", "Max"),
+  Raw_IPW        = round(unname(summ_stats(attrition_weights$raw_ipw)), 3),
+  Stabilized_IPW = round(unname(summ_stats(attrition_weights$stabilized_ipw)), 3)
+)
+cat("\n--- IPW weight diagnostics ---\n"); print(weight_diagnostics)
+
+pel_2004_model_ipw <- pel_2004_model %>%
+  inner_join(attrition_weights %>% select(subject_id, stabilized_ipw), by = "subject_id", relationship = "one-to-one")
+stopifnot(nrow(pel_2004_model_ipw) == nrow(pel_2004_model))
+
+## Weighted bootstrap for the IPW sensitivity analysis: each replicate resamples
+## birth-cohort rows uniformly and refits both IPW stages, so the CIs reflect
+## uncertainty in the weights as well as in the outcome model. Weighted metrics
+## come from compute_weighted_validation_metrics(), evaluated once per
+## replicate.
+bootstrap_ipw_sensitivity <- function(master, prob_col, lp_col, n_boot = N_BOOT, seed = 2024) {
+  set.seed(seed)
+  n <- nrow(master)
+  boot_list <- vector("list", n_boot)
+  warn_env <- new.env(); warn_env$n <- 0
+  for (b in seq_len(n_boot)) {
+    idx <- sample.int(n, size = n, replace = TRUE)
+    rs  <- master[idx, ]
+    boot_list[[b]] <- run_boot_replicate({
+      m1 <- glm(observed_15y_eligible ~ factor(asexo) + factor(acorpele) + factor(aescmae4cat_imp) + arendsm,
+                data = rs[rs$in_stage1_fit, ], family = binomial)
+      m2 <- glm(
+        has_18y_outcome ~ factor(asexo) + factor(acorpele) + school_pos + drugs_pos + isolation_pos +
+          fighting_pos + ranaway_pos + factor(maltreat_cat) + factor(rel_mother_cat) +
+          factor(rel_father_cat) + factor(rel_between_cat),
+        data = rs[rs$in_stage2_fit, ], family = binomial
+      )
+
+      rs$stage1_prob_b <- predict(m1, newdata = rs, type = "response")
+      marg1_b <- mean(rs$observed_15y_eligible[rs$in_stage1_fit])
+
+      rs$stage2_prob_b <- NA_real_
+      rs$stage2_prob_b[rs$in_stage2_fit] <- predict(m2, newdata = rs[rs$in_stage2_fit, ], type = "response")
+      marg2_b <- mean(rs$has_18y_outcome[rs$in_stage2_fit])
+
+      rs$stabilized_ipw_b <- (marg1_b / rs$stage1_prob_b) * (marg2_b / rs$stage2_prob_b)
+
+      ars <- rs[!is.na(rs[[prob_col]]), ]
+      compute_weighted_validation_metrics(ars$depression_outcome, ars[[prob_col]], ars[[lp_col]], ars$stabilized_ipw_b)
+    }, warn_env)
+  }
+  n_failed <- sum(vapply(boot_list, is.null, logical(1)))
+  if (n_failed > 0) cat(sprintf("  (IPW bootstrap: %d/%d replicates failed and were dropped)\n", n_failed, n_boot))
+  if (warn_env$n > 0) cat(sprintf("  (IPW bootstrap: %d warnings raised across %d replicates)\n", warn_env$n, n_boot))
+  boot_df <- bind_rows(boot_list)
+
+  analytic <- master[!is.na(master[[prob_col]]), ]
+  point <- compute_weighted_validation_metrics(analytic$depression_outcome, analytic[[prob_col]], analytic[[lp_col]], analytic$stabilized_ipw)
+
+  out <- point
+  for (m in BOOTSTRAP_METRIC_NAMES) {
+    out[[paste0(m, "_lo")]] <- round(as.numeric(quantile(boot_df[[m]], 0.025, na.rm = TRUE)), 4)
+    out[[paste0(m, "_hi")]] <- round(as.numeric(quantile(boot_df[[m]], 0.975, na.rm = TRUE)), 4)
+  }
+  out
+}
+
+## One row per birth-cohort member with every column needed to refit both IPW
+## stages and evaluate the outcome model, so each bootstrap replicate resamples
+## a single data frame.
+ipw_master <- status_data %>%
+  transmute(
+    subject_id = idalt20241223,
+    in_stage1_fit = eligibility_group != "Excluded (by design / eligibility criterion)",
+    observed_15y_eligible = as.integer(!missing_15y_data & (puberty_data_present %in% TRUE) & !is.na(puberty_started)),
+    in_stage2_fit = !missing_15y_data & baseline_depression == 0 & puberty_started %in% TRUE,
+    has_18y_outcome = as.integer(!missing_18y_outcome),
+    asexo, acorpele, aescmae4cat_imp, arendsm
+  ) %>%
+  left_join(
+    eligible_15y_data %>%
+      transmute(subject_id = idalt20241223, school_pos, drugs_pos, isolation_pos,
+                fighting_pos, ranaway_pos, maltreat_cat, rel_mother_cat, rel_father_cat, rel_between_cat),
+    by = "subject_id", relationship = "one-to-one"
+  ) %>%
+  left_join(
+    pel_2004_model_ipw %>% transmute(subject_id, depression_outcome, lp, predicted_prob, stabilized_ipw),
+    by = "subject_id", relationship = "one-to-one"
+  )
+stopifnot(!anyDuplicated(ipw_master$subject_id), nrow(ipw_master) == nrow(status_data))
+
+## Recalibration intercept for the IPW scenario, held fixed across replicates as
+## in report_sensitivity(): the bootstrap re-estimates the weights, not the
+## recalibration.
+recal_model_ipw <- glm(depression_outcome ~ offset(lp), data = pel_2004_model_ipw, family = binomial,
+                        weights = pel_2004_model_ipw$stabilized_ipw)
+new_intercept_ipw <- unname(coef(recal_model_ipw)[1])
+pel_2004_model_ipw <- pel_2004_model_ipw %>%
+  mutate(lp_recal = lp + new_intercept_ipw, predicted_prob_recal = 1 / (1 + exp(-lp_recal)))
+ipw_master <- ipw_master %>%
+  left_join(pel_2004_model_ipw %>% transmute(subject_id, lp_recal, predicted_prob_recal),
+            by = "subject_id", relationship = "one-to-one")
+stopifnot(nrow(ipw_master) == nrow(status_data))
+
+boot_std_ipw   <- bootstrap_ipw_sensitivity(ipw_master, "predicted_prob", "lp")
+boot_recal_ipw <- bootstrap_ipw_sensitivity(ipw_master, "predicted_prob_recal", "lp_recal")
+perf_table_ipw <- build_table2_style(boot_std_ipw, boot_recal_ipw)
+
+gap_ipw <- decompose_prevalence_gap(pel_2004_model_ipw$depression_outcome, pel_2004_model_ipw$predicted_prob,
+                                      weights = pel_2004_model_ipw$stabilized_ipw) %>%
+  mutate(Scenario = "Sensitivity 1: IPW (maternal education + household income)", .before = 1)
+
+cal_std_ipw   <- build_calibration_plot(pel_2004_model_ipw, "predicted_prob",       "depression_outcome",
+                                          weight_col = "stabilized_ipw", title = "Sensitivity 1: IPW - Original model")
+cal_recal_ipw <- build_calibration_plot(pel_2004_model_ipw, "predicted_prob_recal", "depression_outcome",
+                                          weight_col = "stabilized_ipw", title = "Sensitivity 1: IPW - Recalibrated model")
+
+cat("\n--- Sensitivity 1: IPW (maternal education + household income) ---\n")
+cat(sprintf("N = %d | Observed prevalence = %.1f%% | Mean predicted risk = %.2f%% | Case-mix explains ~%.1f of the %.1f-point rise vs. 1993; residual ~%.1f points\n",
+            nrow(pel_2004_model_ipw), gap_ipw$Observed_prevalence_pct, gap_ipw$Mean_predicted_risk_pct,
+            gap_ipw$Casemix_explained_pct, gap_ipw$Total_gap_pct, gap_ipw$Residual_pct))
+print(perf_table_ipw, width = Inf)
+
+sens1_report <- list(table = perf_table_ipw, gap = gap_ipw, boot_std = boot_std_ipw, boot_recal = boot_recal_ipw,
+                      cal_std = cal_std_ipw, cal_recal = cal_recal_ipw, new_intercept = new_intercept_ipw,
+                      model_data = pel_2004_model_ipw)
+
+## ---- 21. Sensitivity 2: exclusion of IQ < 70-equivalent at age 6 ------------
+
+sens2_sample <- build_sensitivity_sample("baseline_depression", apply_iq = TRUE)
+model_sens2  <- build_sensitivity_model(sens2_sample$final_ids)
+sens2_report <- report_sensitivity("Sensitivity 2: IQ<70-equivalent exclusion (age 6)", model_sens2)
+
+## ---- 22. Sensitivity 3: DAWBA-15 or DAWBA-11 (no SDQ) -----------------------
+## apply_iq = FALSE in Sensitivities 3 and 4: each sensitivity analysis changes
+## one element of the main analysis, so the IQ exclusion is not layered in.
+
+sens3_sample <- build_sensitivity_sample("baseline_depression_dawba_only", apply_iq = FALSE)
+model_sens3  <- build_sensitivity_model(sens3_sample$final_ids)
+sens3_report <- report_sensitivity("Sensitivity 3: DAWBA-15/DAWBA-11 baseline-depression screen", model_sens3)
+
+## ---- 23. Sensitivity 4: SDQ-11 or SDQ-15 (no DAWBA) -------------------------
+
+sens4_sample <- build_sensitivity_sample("baseline_depression_sdq_only", apply_iq = FALSE)
+model_sens4  <- build_sensitivity_model(sens4_sample$final_ids)
+sens4_report <- report_sensitivity("Sensitivity 4: SDQ-11/SDQ-15 baseline-depression screen (no DAWBA)", model_sens4)
+
+## ---- 24. Cross-sensitivity summary tables ------------------------------------
+
+sensitivity_n_accounting <- tibble(
+  Scenario = c("Main analysis",
+               "Sensitivity 1: IPW (reweights; excludes nobody)",
+               "Sensitivity 2: IQ<70-equivalent exclusion (age 6)",
+               "Sensitivity 3: DAWBA-15/DAWBA-11 exclusion",
+               "Sensitivity 4: SDQ-11/SDQ-15 exclusion (no DAWBA)"),
+  N_final = c(n_final, n_final, nrow(model_sens2), nrow(model_sens3), nrow(model_sens4)),
+  ## Positive: smaller than the main sample; negative: larger (possible for
+  ## Sensitivities 3 and 4, whose screens are not nested within the main
+  ## screen).
+  N_diff_vs_main = c(0L, 0L, n_final - nrow(model_sens2), n_final - nrow(model_sens3), n_final - nrow(model_sens4))
+)
+cat("\n--- N accounting across sensitivities ---\n"); print(sensitivity_n_accounting)
+
+## Standard-model comparison at a glance (full tables: sens*_report$table).
+sensitivity_comparison_summary <- bind_rows(
+  boot_main_std %>% mutate(Scenario = "Main analysis", .before = 1),
+  sens1_report$boot_std %>% mutate(Scenario = "Sensitivity 1: IPW", .before = 1),
+  sens2_report$boot_std %>% mutate(Scenario = "Sensitivity 2: IQ exclusion", .before = 1),
+  sens3_report$boot_std %>% mutate(Scenario = "Sensitivity 3: DAWBA exclusion", .before = 1),
+  sens4_report$boot_std %>% mutate(Scenario = "Sensitivity 4: SDQ exclusion (no DAWBA)", .before = 1)
+) %>%
+  transmute(
+    Scenario, N = n, Events = sprintf("%d (%.1f%%)", n_events, 100 * n_events / N),
+    `C-statistic (95% CI)` = fmt_ci_boot(c_statistic, c_statistic_lo, c_statistic_hi),
+    `Calibration slope (95% CI)` = fmt_ci_boot(cal_slope, cal_slope_lo, cal_slope_hi),
+    `O/E ratio (95% CI)` = fmt_ci_boot(OE_ratio, OE_ratio_lo, OE_ratio_hi),
+    `Brier score` = fmt_est(brier, 3)
+  )
+cat("\n--- Sensitivity comparison summary (standard, non-recalibrated) ---\n")
+print(sensitivity_comparison_summary, width = Inf)
+
+prevalence_gap_summary <- bind_rows(gap_main, sens1_report$gap, sens2_report$gap, sens3_report$gap, sens4_report$gap)
+cat("\n--- Prevalence-gap decomposition, all scenarios ---\n"); print(prevalence_gap_summary, width = Inf)
+
+## ---- 25. Comparison tables (S5, S6) and unified sensitivity tables (S9, S10) ----
+
+## Block builder: one row per category of row_var, one column per level of
+## col_var; chi-square, df and p are shown once per block. Percentages are
+## column-wise.
+build_comparison_block <- function(row_var, col_var, group_label) {
+  tab <- table(row_var, col_var)
+  test <- chisq.test(tab)
+  col_totals <- colSums(tab)
+  out <- tibble(Group = group_label, Category = rownames(tab))
+  for (j in seq_len(ncol(tab))) {
+    out[[colnames(tab)[j]]] <- sprintf("%d (%.1f%%)", tab[, j], 100 * tab[, j] / col_totals[j])
+  }
+  out$Chi_sq  <- c(round(unname(test$statistic), 3), rep(NA_real_, nrow(out) - 1))
+  out$df      <- c(unname(test$parameter),          rep(NA_integer_, nrow(out) - 1))
+  out$p_value <- c(format_p(test$p.value),           rep("", nrow(out) - 1))
+  out
+}
+
+## --- Predictor missingness vs. age-18 outcome (diagnostic table) ---
+missingness_outcome_data <- missingness_outcome_data %>%
+  mutate(
+    row_cat = factor(any_predictor_missing, levels = c(FALSE, TRUE),
+                      labels = c("Predictors complete", "Predictors missing")),
+    col_cat = factor(jsmba6, levels = c(0, 1),
+                      labels = c("No depression at 18y", "Depression at 18y"))
+  )
+missingness_vs_outcome_table <- build_comparison_block(missingness_outcome_data$row_cat, missingness_outcome_data$col_cat,
+                              "Any predictor missing (age-15 block)")
+
+## --- Table S6: age-15-eligible sample vs. final age-18 sample ---
+## Two descriptive columns: the age-15-eligible sample and the final sample
+## nested within it. Because the second is a subset of the first, chi-square, df
+## and p come from the equivalent mutually exclusive split of the
+## age-15-eligible sample into "reached age 18" and "lost to follow-up".
+build_wave_comparison_block <- function(category, reached_final, wave1_label, wave2_label, group_label) {
+  tab <- table(category, reached_final)  ## columns: FALSE (lost), TRUE (reached final wave)
+  test <- chisq.test(tab)
+  n_wave1 <- rowSums(tab)
+  n_wave2 <- tab[, "TRUE"]
+  out <- tibble(Group = group_label, Category = rownames(tab))
+  out[[wave1_label]] <- sprintf("%d (%.1f%%)", n_wave1, 100 * n_wave1 / sum(n_wave1))
+  out[[wave2_label]] <- sprintf("%d (%.1f%%)", n_wave2, 100 * n_wave2 / sum(n_wave2))
+  out$Chi_sq  <- c(round(unname(test$statistic), 3), rep(NA_real_, nrow(out) - 1))
+  out$df      <- c(unname(test$parameter),          rep(NA_integer_, nrow(out) - 1))
+  out$p_value <- c(format_p(test$p.value),           rep("", nrow(out) - 1))
+  out
+}
+
+eligible_15y_data <- eligible_15y_data %>%
+  mutate(
+    sex_lbl       = factor(asexo, levels = c(1, 2), labels = c("Male", "Female")),
+    skin_lbl      = factor(acorpele, levels = c(1, 2, 3, 4), labels = c("White", "Black", "Mixed-race", "Other")),
+    drugs_lbl     = factor(drugs_pos,     levels = c(0, 1), labels = c("No", "Yes")),
+    school_lbl    = factor(school_pos,    levels = c(0, 1), labels = c("No", "Yes")),
+    isolation_lbl = factor(isolation_pos, levels = c(0, 1), labels = c("No", "Yes")),
+    fighting_lbl  = factor(fighting_pos,  levels = c(0, 1), labels = c("No", "Yes")),
+    ranaway_lbl   = factor(ranaway_pos,   levels = c(0, 1), labels = c("No", "Yes")),
+    maltreat_lbl  = factor(maltreat_cat, levels = c("None", "Probable", "Severe")),
+    rel_mother_lbl  = factor(rel_mother_cat,  levels = 1:5, labels = c("Great","Very good","Good","Regular","Bad")),
+    rel_father_lbl  = factor(rel_father_cat,  levels = 1:5, labels = c("Great","Very good","Good","Regular","Bad")),
+    rel_between_lbl = factor(rel_between_cat, levels = 1:5, labels = c("Great","Very good","Good","Regular","Bad")),
+    reached_18y = !missing_18y_outcome
+  )
+
+section_b_vars <- list(
+  "Sex"                           = eligible_15y_data$sex_lbl,
+  "Skin colour"                   = eligible_15y_data$skin_lbl,
+  "Drug use"                      = eligible_15y_data$drugs_lbl,
+  "School failure"                = eligible_15y_data$school_lbl,
+  "Social isolation"               = eligible_15y_data$isolation_lbl,
+  "Fight involvement"              = eligible_15y_data$fighting_lbl,
+  "Ran away from home"            = eligible_15y_data$ranaway_lbl,
+  "Childhood maltreatment"        = eligible_15y_data$maltreat_lbl,
+  "Relationship with mother"      = eligible_15y_data$rel_mother_lbl,
+  "Relationship with father"      = eligible_15y_data$rel_father_lbl,
+  "Relationship between parents"  = eligible_15y_data$rel_between_lbl
+)
+
+n_wave1_total <- nrow(eligible_15y_data)
+n_wave2_total <- sum(eligible_15y_data$reached_18y)
+wave1_label <- sprintf("15y-eligible (N=%s)", format(n_wave1_total, big.mark = ","))
+wave2_label <- sprintf("18y final sample (N=%s)", format(n_wave2_total, big.mark = ","))
+
+table_s6_15y_to_18y <- purrr::imap_dfr(section_b_vars, ~ build_wave_comparison_block(
+  .x, eligible_15y_data$reached_18y, wave1_label, wave2_label, .y
+))
+
+## --- Three mutually exclusive stages, full birth cohort (diagnostic table) ---
+## Partitions the birth cohort by the last stage reached: excluded before age-15
+## eligibility ("Baseline"), age-15-eligible but not in the final sample
+## ("15y"), or in the final sample ("Final (18y)"). Each adolescent is in
+## exactly one column, so a single chi-square test on the full R-by-3 table is
+## valid.
+status_data <- status_data %>%
+  mutate(
+    stage3 = factor(
+      case_when(
+        eligibility_status == "Included: valid case" ~ "Final (18y)",
+        !missing_15y_data & baseline_depression == 0 & puberty_started %in% TRUE ~ "15y",
+        TRUE ~ "Baseline"
+      ),
+      levels = c("Baseline", "15y", "Final (18y)")
+    ),
+    sex_lbl    = factor(asexo, levels = c(1, 2), labels = c("Male", "Female")),
+    skin_lbl   = factor(acorpele, levels = c(1, 2, 3, 4), labels = c("White", "Black", "Mixed-race", "Other")),
+    educ_lbl   = factor(aescmae4cat, levels = c(0, 1, 2, 3),
+                          labels = c("0 years", "1\u20134 years", "5\u20138 years", "\u22659 years")),
+    income_lbl = factor(ntile(arendsm, 4), levels = 1:4,
+                          labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")),
+    reached_15y_eligible_lgl = as.logical(reached_15y_eligible)
+  )
+
+section_c_vars <- list(
+  "Sex"                          = status_data$sex_lbl,
+  "Skin colour"                  = status_data$skin_lbl,
+  "Maternal education"           = status_data$educ_lbl,
+  "Household income (quartiles)" = status_data$income_lbl
+)
+
+three_stage_comparison <- purrr::imap_dfr(section_c_vars, ~ build_comparison_block(.x, status_data$stage3, .y))
+cat("\n--- Baseline-15y-Final 3-way comparison (diagnostic, not in manuscript) ---\n")
+print(three_stage_comparison, n = Inf, width = Inf)
+
+## --- Table S5: full birth cohort vs. age-15-eligible sample ---
+## Same logic as Table S6, one step earlier: the age-15-eligible sample is a
+## subset of the birth cohort, so chi-square, df and p come from the split into
+## "reached age-15 eligibility" and "excluded before age 15". The variables are
+## those of the Stage 1 IPW model.
+
+n_birth_total <- nrow(status_data)
+n_15y_total   <- sum(status_data$reached_15y_eligible_lgl, na.rm = TRUE)
+birth_label   <- sprintf("Full birth cohort (N=%s)", format(n_birth_total, big.mark = ","))
+elig15_label  <- sprintf("15y-eligible (N=%s)",       format(n_15y_total,   big.mark = ","))
+
+table_s5_birth_to_15y <- purrr::imap_dfr(section_c_vars, ~ build_wave_comparison_block(
+  .x, status_data$reached_15y_eligible_lgl, birth_label, elig15_label, .y
+))
+
+cat("\n--- Table S5 (birth cohort vs. 15y-eligible) ---\n")
+print(table_s5_birth_to_15y, n = Inf, width = Inf)
+
+## ---- Table S8, transposed (diagnostic table) ------------------------------
+
+sensitivity_table_transposed <- sensitivity_table %>%
+  mutate(across(-Scenario, as.character)) %>%
+  tidyr::pivot_longer(-Scenario, names_to = "Performance parameter", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = Scenario, values_from = value)
+
+cat("\n--- Recoding sensitivity, transposed (diagnostic, not in manuscript) ---\n"); print(sensitivity_table_transposed, width = Inf)
+
+## ---- Tables S9 (original model) and S10 (recalibrated model) --------------
+
+mean_pred_recal <- function(model_data, weight_col = NULL) {
+  if (is.null(weight_col)) 100 * mean(model_data$predicted_prob_recal)
+  else 100 * weighted.mean(model_data$predicted_prob_recal, model_data[[weight_col]])
+}
+
+## residual_pct: the part of the prevalence rise vs. the 1993 cohort (3.1%) not
+## explained by the model's risk factors (observed prevalence minus mean
+## predicted risk). It is always computed from the original model: after
+## recalibration, mean predicted risk equals observed prevalence by
+## construction. weighted_prev_pct replaces the displayed prevalence with a
+## weighted figure (IPW column only), so prevalence, mean predicted risk and
+## residual share the same weighted basis.
+build_perf_column <- function(boot_obj, mean_pred_pct, residual_pct, weighted_prev_pct = NULL) {
+  prev_pct <- if (!is.null(weighted_prev_pct)) weighted_prev_pct else 100 * boot_obj$n_events / boot_obj$n
+  c(
+    N = format(boot_obj$n, big.mark = ","),
+    `Depression prevalence at 18 years, n (%)` = sprintf("%d (%.1f%%)", boot_obj$n_events, prev_pct),
+    `Mean predicted risk, %` = sprintf("%.2f%%", mean_pred_pct),
+    `Residual risk not explained by model, pp` = sprintf("%.1f pp", residual_pct),
+    `C-statistic (95% CI)` = fmt_ci_boot(boot_obj$c_statistic, boot_obj$c_statistic_lo, boot_obj$c_statistic_hi),
+    `Mean calibration error (predicted - observed)` = fmt_ci_boot(boot_obj$mean_cal_error, boot_obj$mean_cal_error_lo, boot_obj$mean_cal_error_hi, 3),
+    `Calibration-in-the-large (log-odds scale)` = fmt_ci_boot(boot_obj$citl_logodds, boot_obj$citl_logodds_lo, boot_obj$citl_logodds_hi),
+    `Calibration intercept (95% CI)` = fmt_ci_boot(boot_obj$cal_intercept, boot_obj$cal_intercept_lo, boot_obj$cal_intercept_hi),
+    `Calibration slope (95% CI)` = fmt_ci_boot(boot_obj$cal_slope, boot_obj$cal_slope_lo, boot_obj$cal_slope_hi),
+    `O/E ratio (95% CI)` = fmt_ci_boot(boot_obj$OE_ratio, boot_obj$OE_ratio_lo, boot_obj$OE_ratio_hi),
+    `Brier score` = fmt_ci_boot(boot_obj$brier, boot_obj$brier_lo, boot_obj$brier_hi, 3),
+    `ICI / E-avg (mean absolute calibration error)` = fmt_ci_boot(boot_obj$ici, boot_obj$ici_lo, boot_obj$ici_hi),
+    `E50 (median absolute calibration error)` = fmt_ci_boot(boot_obj$e50, boot_obj$e50_lo, boot_obj$e50_hi),
+    `E90 (90th percentile absolute calibration error)` = fmt_ci_boot(boot_obj$e90, boot_obj$e90_lo, boot_obj$e90_hi),
+    `Emax (max. absolute calibration error)` = fmt_ci_boot(boot_obj$emax, boot_obj$emax_lo, boot_obj$emax_hi)
+  )
+}
+
+table_s9_original <- tibble(
+  `Performance parameter` = names(build_perf_column(boot_main_std, gap_main$Mean_predicted_risk_pct, gap_main$Residual_pct)),
+  `Main analysis` = unname(build_perf_column(boot_main_std, gap_main$Mean_predicted_risk_pct, gap_main$Residual_pct)),
+  `IPW-weighted`  = unname(build_perf_column(sens1_report$boot_std, sens1_report$gap$Mean_predicted_risk_pct, sens1_report$gap$Residual_pct,
+                                               weighted_prev_pct = sens1_report$gap$Observed_prevalence_pct)),
+  `IQ`            = unname(build_perf_column(sens2_report$boot_std, sens2_report$gap$Mean_predicted_risk_pct, sens2_report$gap$Residual_pct)),
+  `DAWBA`         = unname(build_perf_column(sens3_report$boot_std, sens3_report$gap$Mean_predicted_risk_pct, sens3_report$gap$Residual_pct)),
+  `SDQ`           = unname(build_perf_column(sens4_report$boot_std, sens4_report$gap$Mean_predicted_risk_pct, sens4_report$gap$Residual_pct))
+)
+
+## Residual_pct is the same original-model value as in Table S9.
+table_s10_recalibrated <- tibble(
+  `Performance parameter` = names(build_perf_column(boot_main_recal, mean_pred_recal(pel_2004_model), gap_main$Residual_pct)),
+  `Main analysis` = unname(build_perf_column(boot_main_recal, mean_pred_recal(pel_2004_model), gap_main$Residual_pct)),
+  `IPW-weighted`  = unname(build_perf_column(sens1_report$boot_recal, mean_pred_recal(sens1_report$model_data, "stabilized_ipw"), sens1_report$gap$Residual_pct,
+                                               weighted_prev_pct = sens1_report$gap$Observed_prevalence_pct)),
+  `IQ`            = unname(build_perf_column(sens2_report$boot_recal, mean_pred_recal(sens2_report$model_data), sens2_report$gap$Residual_pct)),
+  `DAWBA`         = unname(build_perf_column(sens3_report$boot_recal, mean_pred_recal(sens3_report$model_data), sens3_report$gap$Residual_pct)),
+  `SDQ`           = unname(build_perf_column(sens4_report$boot_recal, mean_pred_recal(sens4_report$model_data), sens4_report$gap$Residual_pct))
+)
+
+cat("\n--- Table S9 (original model, unified) ---\n"); print(table_s9_original, width = Inf)
+cat("\n--- Table S10 (recalibrated model, unified) ---\n"); print(table_s10_recalibrated, width = Inf)
+
+## ---- 26. Prevalence of current MDD at age 18 (no exclusions) ------------------
+## MDD = major depressive disorder. Denominator: every cohort member with an
+## age-18 MINI depression result, regardless of age-15 participation or
+## eligibility. Two definitions are reported: (1) MINI major depressive episode
+## as scored, in which manic/hypomanic cases are not removed; (2) the
+## main-analysis definition, in which adolescents with a lifetime
+## manic/hypomanic episode are non-cases (Section 8). Definition (2) is the
+## like-for-like comparator for the analytic sample.
+full_18y <- status_data %>% filter(!is.na(jsmba6))
+prev_ci_text <- function(k, n) {
+  ci <- binom.test(k, n)$conf.int          # exact (Clopper-Pearson) interval
+  sprintf("%d/%d = %.1f%% (95%% CI %.1f to %.1f)", k, n, 100 * k / n, 100 * ci[1], 100 * ci[2])
+}
+stopifnot(!anyNA(full_18y$ever_manic_hypomanic))   # mania screen available for everyone with an age-18 MINI
+prevalence_full_cohort <- tibble(
+  Definition = c("MINI MDE as scored (manic/hypomanic cases NOT removed)",
+                 "Main-analysis definition (lifetime manic/hypomanic recoded as non-case)",
+                 "Memo: analytic sample, main-analysis definition"),
+  `n / N (%, 95% CI)` = c(
+    prev_ci_text(sum(full_18y$jsmba6 == 1), nrow(full_18y)),
+    prev_ci_text(sum(ifelse(full_18y$ever_manic_hypomanic, 0, full_18y$jsmba6)), nrow(full_18y)),
+    prev_ci_text(n_events, n_analytic)
+  )
+)
+cat(sprintf("\n--- Prevalence of current MDD at 18y, all %d adolescents with an 18y MINI result (no exclusions) ---\n", nrow(full_18y)))
+cat(sprintf("Lifetime manic/hypomanic episode: %d (of whom %d met MINI MDE criteria)\n",
+            sum(full_18y$ever_manic_hypomanic), sum(full_18y$ever_manic_hypomanic & full_18y$jsmba6 == 1)))
+print(prevalence_full_cohort, width = Inf)
+
+## ---- 27. Results workbook (one .xlsx, all sheets) ---------------------------
+## Sheet names follow the manuscript's table numbering. Sheets without a
+## numbered manuscript table are listed last.
+
+table_s7_model_spec <- tibble::tribble(
+    ~Term, ~Coefficient,
+    "Intercept", coef_pmle$intercept,
+    "Sex (female=1)", coef_pmle$sex,
+    "Skin colour (non-white=1)", coef_pmle$ethnicity,
+    "School failure", coef_pmle$school_failure,
+    "Any drug use", coef_pmle$drugs,
+    "Social isolation", coef_pmle$social_isolation,
+    "Fight involvement", coef_pmle$fighting,
+    "Ran away from home", coef_pmle$ran_away,
+    "Maltreatment - probable", coef_pmle$maltreatment_prob,
+    "Maltreatment - severe", coef_pmle$maltreatment_severe,
+    "Relationship w/ mother - very good", coef_pmle$mom_2,
+    "Relationship w/ mother - good", coef_pmle$mom_3,
+    "Relationship w/ mother - regular", coef_pmle$mom_4,
+    "Relationship w/ mother - bad", coef_pmle$mom_5,
+    "Relationship w/ father - very good", coef_pmle$dad_2,
+    "Relationship w/ father - good", coef_pmle$dad_3,
+    "Relationship w/ father - regular", coef_pmle$dad_4,
+    "Relationship w/ father - bad", coef_pmle$dad_5,
+    "Relationship between parents - very good", coef_pmle$btw_2,
+    "Relationship between parents - good", coef_pmle$btw_3,
+    "Relationship between parents - regular", coef_pmle$btw_4,
+    "Relationship between parents - bad", coef_pmle$btw_5,
+    "Sex x skin colour", coef_pmle$sex_x_ethnicity,
+    "Sex x school failure", coef_pmle$sex_x_school_fail,
+    "Sex x drug use", coef_pmle$sex_x_drugs,
+    "Sex x social isolation", coef_pmle$sex_x_social_iso,
+    "Sex x fighting", coef_pmle$sex_x_fighting,
+    "Sex x ran away", coef_pmle$sex_x_ran_away,
+    "Sex x maltreatment (probable)", coef_pmle$sex_x_prob_malt,
+    "Sex x maltreatment (severe)", coef_pmle$sex_x_severe_malt,
+    "Sex x relationship w/ mother (very good)", coef_pmle$sex_x_mom_2,
+    "Sex x relationship w/ mother (good)", coef_pmle$sex_x_mom_3,
+    "Sex x relationship w/ mother (regular)", coef_pmle$sex_x_mom_4,
+    "Sex x relationship w/ mother (bad)", coef_pmle$sex_x_mom_5,
+    "Sex x relationship w/ father (very good)", coef_pmle$sex_x_dad_2,
+    "Sex x relationship w/ father (good)", coef_pmle$sex_x_dad_3,
+    "Sex x relationship w/ father (regular)", coef_pmle$sex_x_dad_4,
+    "Sex x relationship w/ father (bad)", coef_pmle$sex_x_dad_5,
+    "Sex x relationship between parents (very good)", coef_pmle$sex_x_btw_2,
+    "Sex x relationship between parents (good)", coef_pmle$sex_x_btw_3,
+    "Sex x relationship between parents (regular)", coef_pmle$sex_x_btw_4,
+    "Sex x relationship between parents (bad)", coef_pmle$sex_x_btw_5,
+    "Intercept (recalibrated to 2004 prevalence)", round(coef_pmle$intercept + as.numeric(new_intercept), 3)
+  )
+
+results_workbook <- list(
+  ## -- Main text --
+  "Fig S1 - Flow table"           = flow_table,
+  "Baseline depression exclusion" = baseline_depression_exclusion,
+  "Table 1 - Predictors"          = table1_final,
+  "Table 2 - Validation"          = table2_manuscript,
+
+  ## -- Supplementary tables S3-S10 (sheet names capped at 31 characters) --
+  "Table S3 - Eligib. & attrition" = eligibility_summary,
+  "Table S4 - Missingness"         = predictor_missingness_by_var,
+  "Table S5 - Birth to 15y"        = table_s5_birth_to_15y,
+  "Table S6 - 15y to 18y"          = table_s6_15y_to_18y,
+  "Table S7 - Model spec"          = table_s7_model_spec,
+  "Table S8 - Recoding sens."      = sensitivity_table,
+  "Table S9 - Original model"      = table_s9_original,
+  "Table S10 - Recalib. model"     = table_s10_recalibrated,
+
+  ## -- Supporting outputs --
+  "No-parent-figure recode n"    = recode_summary,
+  "Linear predictor comparison"  = linear_predictor_comparison,
+  "Predicted risk distribution"  = predicted_risk_distribution,
+  "Screening diagnostics"        = screening_diagnostics,
+  "Missing screen as negative"   = missing_screen_as_negative,
+  "IPW weight diagnostics"       = weight_diagnostics,
+  "Sensitivity N accounting"     = sensitivity_n_accounting,
+  "Sensitivity comparison"       = sensitivity_comparison_summary,
+  "Prevalence-gap decomposition" = prevalence_gap_summary,
+  "Sensitivity 1 - IPW perf"     = sens1_report$table,
+  "Sensitivity 2 - IQ perf"      = sens2_report$table,
+  "Sensitivity 3 - DAWBA perf"   = sens3_report$table,
+  "Sensitivity 4 - SDQ perf"     = sens4_report$table,
+
+  ## -- Additional outputs not reported as numbered tables in the manuscript --
+  "Attrition chi-sq (extra)"       = attrition_chisq_tests,
+  "Missingness omnibus (extra)"    = missingness_vs_outcome_table,
+  "Baseline-15y-Final (extra)"     = three_stage_comparison,
+  "Recoding sens (transposed)"     = sensitivity_table_transposed,
+
+  "Prevalence, no exclusions"      = prevalence_full_cohort   # Section 26
+)
+
+write.xlsx(results_workbook, file = "results/IDEA_RS_validation_results.xlsx", asTable = FALSE, overwrite = TRUE)
+cat("\nAll result tables written to: results/IDEA_RS_validation_results.xlsx\n")
+cat(sprintf("Sheets: %s\n", paste(names(results_workbook), collapse = " | ")))
+
+## ---- 28. Sensitivity calibration plots (Figures S2-S5) ----------------------
+## Each scenario's original and recalibrated plots side by side (patchwork); all
+## five scenarios are then stacked into one overview figure.
+
+make_row <- function(cal_std, cal_recal, scenario_label) {
+  p_std   <- cal_std   + labs(title = paste0(scenario_label, " \u2014 Original model"))
+  p_recal <- cal_recal + labs(title = "Recalibrated model")
+  p_std + p_recal
+}
+
+row_main  <- make_row(cal_standard_plot, cal_recal_plot, "Main analysis")
+row_sens1 <- make_row(sens1_report$cal_std, sens1_report$cal_recal, "IPW-adjusted")
+row_sens2 <- make_row(sens2_report$cal_std, sens2_report$cal_recal, "IQ<70 exclusion")
+row_sens3 <- make_row(sens3_report$cal_std, sens3_report$cal_recal, "DAWBA 11y/15y exclusion")
+row_sens4 <- make_row(sens4_report$cal_std, sens4_report$cal_recal, "SDQ 11y/15y exclusion")
+
+ggsave("results/figure_s2_calibration_ipw.png", row_sens1, width = 12, height = 5.5, dpi = 300)
+ggsave("results/figure_s3_calibration_iq.png", row_sens2, width = 12, height = 5.5, dpi = 300)
+ggsave("results/figure_s4_calibration_dawba.png", row_sens3, width = 12, height = 5.5, dpi = 300)
+ggsave("results/figure_s5_calibration_sdq.png", row_sens4, width = 12, height = 5.5, dpi = 300)
+
+all_cal_combined <- row_main / row_sens1 / row_sens2 / row_sens3 / row_sens4
+ggsave("results/calibration_all_scenarios.png", all_cal_combined, width = 12, height = 25, dpi = 300)
+
+cat("\nAnalysis complete.\n")
+
+print(sessionInfo())
+
+```
